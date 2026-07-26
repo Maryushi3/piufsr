@@ -1,0 +1,6 @@
+.DS_Store
+*.swp
+*.swo
+cal_web/venv/
+calibrate/venv/
+__pycache__/
