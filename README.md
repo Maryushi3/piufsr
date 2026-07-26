@@ -187,8 +187,9 @@ fsrActive bit = (compensated >= threshold)
 5. Physical panel → I2C address mapping is up to you
 
 ### 2. Flash master
-1. Upload `master/master.ino` to Pro Micro
-2. Connect SDA/SCL to all slaves (pull-ups on bus)
+1. Install **Joystick** library by **NicoHood** (Library Manager)
+2. Upload `master/master.ino` to Pro Micro
+3. Connect SDA/SCL to all slaves (pull-ups on bus)
 
 ### 3. First-time calibration
 ```
