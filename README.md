@@ -22,11 +22,18 @@ A Pro Micro master polls all 5 slaves over I2C at ~1.4 kHz, reports button state
 ## Hardware Wiring
 
 ### I2C Bus (Master ↔ Slaves)
-- SDA → A4 (on both Pro Micro and Pro Mini)
-- SCL → A5
-- 5.1kΩ pull-ups on SDA and SCL to 5V
+
+| Signal | Color | Pro Micro (Master) | Pro Mini (Slave) |
+|--------|-------|--------------------|------------------|
+| SDA    | Green | D2 (pin 5)        | A4 (pin 27)      |
+| SCL    | Blue  | D3 (pin 6)        | A5 (pin 28)      |
+| 5V     | Red   | VCC                | VCC              |
+| GND    | Black | GND                | GND              |
+
+- 5.1kΩ pull-ups on SDA and SCL to 5V (one set per bus, not per slave)
 - 400 kHz clock
 - 2 ms timeout per transaction
+- All 5 slaves connected in parallel on the same 4 wires
 
 ### FSRs (per slave/panel)
 Each FSR forms a voltage divider:
