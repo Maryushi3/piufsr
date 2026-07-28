@@ -1,4 +1,5 @@
-#include <Joystick.h>
+#include "HID-Project.h"
+#include <avr/wdt.h>
 
 #define NUM_PANELS      5
 #define FSRS_PER_PANEL  4
@@ -8,19 +9,22 @@ static const uint8_t kPanelAddresses[NUM_PANELS] = {0x10, 0x11, 0x12, 0x13, 0x14
 static const int32_t kI2CClock = 400000L;
 static const int32_t kSerialBaud = 115200;
 static const int32_t kSendIntervalUs = 1000;
-static const uint32_t kI2CTimeoutUs = 2000;
+// Must exceed the slave's worst-case interrupt blackout: one 256-LED
+// FastLED.show() is ~8 ms. With a shorter timeout the master would abort
+// mid-stretch, which can wedge the slave's TWI state machine.
+static const uint32_t kI2CTimeoutUs = 12000;
+static const uint8_t kMaxPanelFails = 5;
 
 static bool panelActive[NUM_PANELS];
 static bool prevPanelActive[NUM_PANELS];
 static uint8_t calValues[NUM_SENSORS];
+static uint8_t panelFailCount[NUM_PANELS];
+static unsigned long lastBusRecoverMs;
 static unsigned long lastSendUs;
-static int loopTimeUs;
+static unsigned long lastIterationUs;
+static bool firstLoop;
 static bool calibrating;
 static unsigned long calPrintUs;
-
-Joystick_ Joystick(JOYSTICK_DEFAULT_REPORT_ID, JOYSTICK_TYPE_GAMEPAD, 5, 0,
-                   false, false, false, false, false, false,
-                   false, false, false, false, false);
 
 /*===========================================================================*/
 /* TWI master with timeout                                                  */
@@ -40,6 +44,9 @@ static bool twiWait(uint32_t* deadline) {
   while (!(TWCR & _BV(TWINT))) {
     if (micros() > *deadline) {
       TWCR = _BV(TWINT) | _BV(TWSTO) | _BV(TWEN);
+      uint32_t t = micros() + 100;
+      while (!(TWCR & _BV(TWSTO)) && micros() < t);
+      TWCR = _BV(TWEN);
       return false;
     }
   }
@@ -53,6 +60,37 @@ static bool twiStart(uint32_t* deadline) {
 
 static void twiStop() {
   TWCR = _BV(TWINT) | _BV(TWSTO) | _BV(TWEN);
+}
+
+// Bit-banged bus recovery. A slave interrupted mid-byte can be left waiting
+// for the missing bit-clocks while holding SDA low, wedging the whole bus.
+// Clocking SCL up to 9 times lets it finish the byte and release SDA,
+// followed by a STOP and a TWI re-init. (32U4: PD0 = SCL, PD1 = SDA.)
+static void twiBusRecover() {
+  TWCR = 0;  // TWI off, pins become GPIO
+  // Release both lines (input + pull-up; external 5.1k pull-ups do the work)
+  DDRD &= ~(_BV(PD0) | _BV(PD1));
+  PORTD |= _BV(PD0) | _BV(PD1);
+  delayMicroseconds(10);
+  for (uint8_t i = 0; i < 9 && !(PIND & _BV(PD1)); i++) {  // while SDA held low
+    PORTD &= ~_BV(PD0);
+    DDRD |= _BV(PD0);                                     // SCL low
+    delayMicroseconds(10);
+    DDRD &= ~_BV(PD0);
+    PORTD |= _BV(PD0);                                    // SCL released
+    delayMicroseconds(10);
+  }
+  // STOP condition: SDA low, then SCL high, then SDA high
+  PORTD &= ~_BV(PD1);
+  DDRD |= _BV(PD1);                                       // SDA low
+  delayMicroseconds(10);
+  DDRD &= ~_BV(PD0);
+  PORTD |= _BV(PD0);                                      // SCL released
+  delayMicroseconds(10);
+  DDRD &= ~_BV(PD1);
+  PORTD |= _BV(PD1);                                      // SDA released
+  delayMicroseconds(10);
+  twiInit();
 }
 
 static bool twiSendAddr(uint8_t addr, bool read, uint32_t* deadline) {
@@ -103,19 +141,23 @@ static bool twiWrite(uint8_t addr, uint8_t* data, uint8_t len) {
   return true;
 }
 
-/*===========================================================================*/
-
-static void sendLEDCommand(int panel, bool on) {
-  uint8_t cmd = on ? 0x01 : 0x00;
-  twiWrite(kPanelAddresses[panel], &cmd, 1);
+// Probe whether a slave ACKs its address (no data transferred).
+static bool twiProbe(uint8_t addr) {
+  uint32_t deadline = micros() + kI2CTimeoutUs;
+  if (!twiStart(&deadline)) return false;
+  bool ok = twiSendAddr(addr, TWI_WRITE, &deadline);
+  twiStop();
+  return ok;
 }
+
+/*===========================================================================*/
 
 static void updateGamepad() {
   for (int p = 0; p < NUM_PANELS; p++) {
     if (panelActive[p]) {
-      Joystick.pressButton(p + 1);
+      Gamepad.press(p + 1);
     } else {
-      Joystick.releaseButton(p + 1);
+      Gamepad.release(p + 1);
     }
   }
 }
@@ -123,45 +165,84 @@ static void updateGamepad() {
 static void handleLEDTransitions() {
   for (int p = 0; p < NUM_PANELS; p++) {
     if (panelActive[p] != prevPanelActive[p]) {
-      sendLEDCommand(p, panelActive[p]);
-      prevPanelActive[p] = panelActive[p];
+      uint8_t cmd = panelActive[p] ? 0x01 : 0x00;
+      if (twiWrite(kPanelAddresses[p], &cmd, 1)) {
+        prevPanelActive[p] = panelActive[p];
+      }
     }
   }
 }
 
 static void pollAllPanels() {
   for (int p = 0; p < NUM_PANELS; p++) {
+    // Never stop polling a panel: a genuinely absent slave fails fast (NACK),
+    // and a busy slave (e.g. mid LED update) recovers within a few polls.
     uint8_t buf[5];
-    if (twiRead(kPanelAddresses[p], buf, 5)) {
+    // The status byte only uses the low nibble — a set high bit means a
+    // corrupt frame (e.g. two slaves sharing an address); count it as a
+    // failure rather than consuming garbage.
+    bool ok = twiRead(kPanelAddresses[p], buf, 5) && !(buf[0] & 0xF0);
+    if (ok) {
+      if (panelFailCount[p] >= kMaxPanelFails) {
+        Serial.print(F("Panel "));
+        Serial.print(p);
+        Serial.println(F(" online"));
+      }
+      panelFailCount[p] = 0;
       panelActive[p] = (buf[0] & 0x0F) != 0;
       int base = p * FSRS_PER_PANEL;
       for (int i = 0; i < FSRS_PER_PANEL; i++) {
         calValues[base + i] = buf[i + 1];
       }
+    } else if (panelFailCount[p] < kMaxPanelFails) {
+      panelFailCount[p]++;
+      if (panelFailCount[p] >= kMaxPanelFails) {
+        Serial.print(F("Panel "));
+        Serial.print(p);
+        Serial.println(F(" offline"));
+      }
+    } else if (millis() - lastBusRecoverMs >= 1000) {
+      // Panel unreachable for a sustained time: a slave may be wedged
+      // mid-transaction and holding the bus. Try to release it.
+      twiBusRecover();
+      lastBusRecoverMs = millis();
     }
   }
 }
+
+static void printPrompt();
+static void printHelp();
+static void handleIdentify(char* buf);
+static void handleScan();
 
 void setup() {
   Serial.begin(kSerialBaud);
   twiInit();
   for (int p = 0; p < NUM_PANELS; p++) panelActive[p] = prevPanelActive[p] = false;
-  Joystick.begin(false);
+  Gamepad.begin();
   lastSendUs = 0;
-  loopTimeUs = -1;
+  lastIterationUs = 0;
+  firstLoop = true;
   calibrating = false;
   calPrintUs = 0;
+  for (int p = 0; p < NUM_PANELS; p++) panelFailCount[p] = 0;
+  lastBusRecoverMs = 0;
+  wdt_enable(WDTO_2S);
+  Serial.println(F("PIUFSR Master ready."));
+  printHelp();
+  printPrompt();
 }
 
 void loop() {
   unsigned long now = micros();
+  wdt_reset();
 
   pollAllPanels();
   handleLEDTransitions();
 
-  if (loopTimeUs == -1 || now - lastSendUs + loopTimeUs >= kSendIntervalUs) {
+  if (firstLoop || (now - lastSendUs + lastIterationUs >= kSendIntervalUs)) {
     updateGamepad();
-    Joystick.sendState();
+    Gamepad.write();
     lastSendUs = now;
   }
 
@@ -177,9 +258,10 @@ void loop() {
 
   processSerial();
 
-  if (loopTimeUs == -1) {
-    loopTimeUs = micros() - now;
+  if (firstLoop) {
+    firstLoop = false;
   }
+  lastIterationUs = micros() - now;
 }
 
 /*===========================================================================*/
@@ -193,29 +275,71 @@ static uint8_t hexNibble(char c) {
   return 0;
 }
 
-static void processSerial() {
-  while (Serial.available() > 0) {
-    static char buf[128];
-    size_t len = Serial.readBytesUntil('\n', buf, sizeof(buf) - 1);
-    buf[len] = '\0';
-    if (len == 0) return;
+static void printPrompt() {
+  Serial.print(F("> "));
+}
 
-    switch (buf[0]) {
-      case 'o': case 'O': handleZeroOffsets(); break;
-      case 'v': case 'V': printValues(); break;
-      case 't': case 'T': printThresholds(); break;
-      case 's': case 'S':
-        if (buf[1] == ' ' || buf[1] == '\t' || (buf[1] >= '0' && buf[1] <= '9')) {
-          handleSetThreshold(buf + 1);
-        } else {
-          handleSaveCal();
-        }
-        break;
-      case 'c': case 'C': calibrating = !calibrating; calPrintUs = micros(); break;
-      case 'u': case 'U': handleUploadPattern(buf); break;
-      case 'x': case 'X': handleSetPixel(buf); break;
-      case 'w': case 'W': handleWritePattern(buf); break;
-      default:  handleSetThreshold(buf); break;
+static void printHelp() {
+  Serial.println(F("  o          Zero offsets (feet off)"));
+  Serial.println(F("  v          Print compensated values"));
+  Serial.println(F("  t          Print thresholds"));
+  Serial.println(F("  s          Save calibration to EEPROM"));
+  Serial.println(F("  s <i> <v>  Set threshold sensor i (0-19) to v (0-255)"));
+  Serial.println(F("  c          Toggle streaming 20Hz"));
+  Serial.println(F("  u <p> <s> <64hex>  Upload 32B pattern to panel p slot s"));
+  Serial.println(F("  x <p> <x> <y> <0/1>  Set pixel on panel p"));
+  Serial.println(F("  w <p> <s>  Save pattern to EEPROM slot s"));
+  Serial.println(F("  i <p>      Identify panel p (blink LED)"));
+  Serial.println(F("  i          Scan bus for panels"));
+  Serial.println(F("  h / ?      This help"));
+}
+
+static void processSerial() {
+  static char line[128];
+  static size_t pos = 0;
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (pos == 0) continue;
+      line[pos] = '\0';
+      pos = 0;
+      char* buf = line;
+
+      switch (buf[0]) {
+        case 'o': case 'O': handleZeroOffsets(); break;
+        case 'v': case 'V': printValues(); break;
+        case 't': case 'T': printThresholds(); break;
+        case 's': case 'S':
+          if (buf[1] == ' ' || buf[1] == '\t' || (buf[1] >= '0' && buf[1] <= '9')) {
+            handleSetThreshold(buf + 1);
+          } else {
+            handleSaveCal();
+          }
+          break;
+        case 'c': case 'C':
+          calibrating = !calibrating;
+          calPrintUs = micros();
+          Serial.print(F("Streaming "));
+          Serial.println(calibrating ? F("ON") : F("OFF"));
+          break;
+        case 'u': case 'U': handleUploadPattern(buf); break;
+        case 'x': case 'X': handleSetPixel(buf); break;
+        case 'w': case 'W': handleWritePattern(buf); break;
+        case 'i': case 'I':
+          if (buf[1] == '\0') {
+            handleScan();
+          } else {
+            handleIdentify(buf);
+          }
+          break;
+        case 'h': case 'H': case '?': printHelp(); break;
+        default:
+          Serial.println(F("Unknown. Type h for help."));
+          break;
+      }
+      printPrompt();
+    } else if (pos < sizeof(line) - 1) {
+      line[pos++] = c;
     }
   }
 }
@@ -223,9 +347,11 @@ static void processSerial() {
 static void handleZeroOffsets() {
   uint8_t cmd = 0x05;
   for (int p = 0; p < NUM_PANELS; p++) {
-    twiWrite(kPanelAddresses[p], &cmd, 1);
+    bool ok = twiWrite(kPanelAddresses[p], &cmd, 1);
+    Serial.print(F("Panel "));
+    Serial.print(p);
+    Serial.println(ok ? F(" OK") : F(" FAIL"));
   }
-  Serial.println(F("Offsets updated on all panels."));
 }
 
 static void printValues() {
@@ -254,9 +380,11 @@ static void printThresholds() {
 static void handleSaveCal() {
   uint8_t cmd = 0x07;
   for (int p = 0; p < NUM_PANELS; p++) {
-    twiWrite(kPanelAddresses[p], &cmd, 1);
+    bool ok = twiWrite(kPanelAddresses[p], &cmd, 1);
+    Serial.print(F("Panel "));
+    Serial.print(p);
+    Serial.println(ok ? F(" OK") : F(" FAIL"));
   }
-  Serial.println(F("Calibration saved."));
 }
 
 static void handleSetThreshold(char* buf) {
@@ -268,8 +396,33 @@ static void handleSetThreshold(char* buf) {
   int panel = idx / FSRS_PER_PANEL;
   int fsr = idx % FSRS_PER_PANEL;
   uint8_t cmd[] = {0x06, (uint8_t)fsr, (uint8_t)val};
-  twiWrite(kPanelAddresses[panel], cmd, 3);
+  bool ok = twiWrite(kPanelAddresses[panel], cmd, 3);
+  Serial.print(F("Panel "));
+  Serial.print(panel);
+  Serial.println(ok ? F(" OK") : F(" FAIL"));
   printThresholds();
+}
+
+static void handleScan() {
+  for (int p = 0; p < NUM_PANELS; p++) {
+    Serial.print(F("0x"));
+    Serial.print(kPanelAddresses[p], HEX);
+    Serial.print(F(" (panel "));
+    Serial.print(p);
+    Serial.print(F("): "));
+    Serial.println(twiProbe(kPanelAddresses[p]) ? F("OK") : F("--"));
+  }
+}
+
+static void handleIdentify(char* buf) {
+  char* end = nullptr;
+  long panel = strtol(buf + 1, &end, 10);
+  if (panel < 0 || panel >= NUM_PANELS) return;
+  uint8_t cmd = 0x0B;
+  bool ok = twiWrite(kPanelAddresses[panel], &cmd, 1);
+  Serial.print(F("Panel "));
+  Serial.print(panel);
+  Serial.println(ok ? F(" blink OK") : F(" FAIL"));
 }
 
 static void handleUploadPattern(char* buf) {
@@ -277,6 +430,7 @@ static void handleUploadPattern(char* buf) {
   long panel = strtol(buf + 1, &end, 10);
   long slot = strtol(end, &end, 10);
   if (panel < 0 || panel >= NUM_PANELS || slot < 0 || slot >= 4) return;
+  while (*end == ' ' || *end == '\t') end++;
   char* hex = end;
   uint8_t data[34];
   data[0] = 0x03;
@@ -285,14 +439,10 @@ static void handleUploadPattern(char* buf) {
     if (hex[i * 2] == '\0' || hex[i * 2 + 1] == '\0') return;
     data[i + 2] = (hexNibble(hex[i * 2]) << 4) | hexNibble(hex[i * 2 + 1]);
   }
-  if (twiWrite(kPanelAddresses[panel], data, 34)) {
-    Serial.print(F("Uploaded to panel "));
-    Serial.print(panel);
-    Serial.print(F(" slot "));
-    Serial.println(slot);
-  } else {
-    Serial.println(F("Upload failed"));
-  }
+  bool ok = twiWrite(kPanelAddresses[panel], data, 34);
+  Serial.print(F("Panel "));
+  Serial.print(panel);
+  Serial.println(ok ? F(" OK") : F(" FAIL"));
 }
 
 static void handleSetPixel(char* buf) {
@@ -303,7 +453,10 @@ static void handleSetPixel(char* buf) {
   long on = strtol(end, nullptr, 10);
   if (panel < 0 || panel >= NUM_PANELS || x < 0 || x > 15 || y < 0 || y > 15) return;
   uint8_t cmd[] = {0x09, (uint8_t)x, (uint8_t)y, on ? (uint8_t)1 : (uint8_t)0};
-  twiWrite(kPanelAddresses[panel], cmd, 4);
+  bool ok = twiWrite(kPanelAddresses[panel], cmd, 4);
+  Serial.print(F("Panel "));
+  Serial.print(panel);
+  Serial.println(ok ? F(" OK") : F(" FAIL"));
 }
 
 static void handleWritePattern(char* buf) {
@@ -312,9 +465,8 @@ static void handleWritePattern(char* buf) {
   long slot = strtol(end, nullptr, 10);
   if (panel < 0 || panel >= NUM_PANELS || slot < 0 || slot >= 4) return;
   uint8_t cmd[] = {0x0A, (uint8_t)slot};
-  twiWrite(kPanelAddresses[panel], cmd, 2);
-  Serial.print(F("Pattern saved to panel "));
+  bool ok = twiWrite(kPanelAddresses[panel], cmd, 2);
+  Serial.print(F("Panel "));
   Serial.print(panel);
-  Serial.print(F(" slot "));
-  Serial.println(slot);
+  Serial.println(ok ? F(" OK") : F(" FAIL"));
 }

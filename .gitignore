@@ -3,4 +3,5 @@
 *.swo
 cal_web/venv/
 calibrate/venv/
+ledmaker/venv/
 __pycache__/
