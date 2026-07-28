@@ -9,6 +9,12 @@ serial port:
   3. lights each pixel one at a time and asks whether to keep it on,
   4. saves the resulting bitmap to the panel's EEPROM slot.
 
+Coordinates are LOGICAL: (x, y) as seen facing the panel, (0,0) = top-left,
+y downward. Each panel's LED matrix may be wired/mounted differently, so a
+per-panel layout table (PANEL_LAYOUTS below) translates logical positions
+to the linear pixel index the slave expects. Run with --identify to light
+landmark pixels on a panel and discover its layout.
+
 Protocol notes:
   Every command is answered with "Panel <p> OK" or "Panel <p> FAIL".
   The master also prints a "> " prompt after each reply, which glues onto
@@ -17,6 +23,7 @@ Protocol notes:
 
 Usage:
     python3 ledmaker.py <serial_port> [--baud 115200] [--delay 0.05] [--retries 3]
+    python3 ledmaker.py <serial_port> --identify
 """
 import argparse
 import sys
@@ -33,6 +40,90 @@ DEFAULT_BAUD = 115200
 DEFAULT_DELAY = 0.05   # seconds to wait after each command before reading
 REPLY_TIMEOUT = 1.0    # max seconds to wait for one reply
 MAX_RETRIES = 3
+
+# ---------------------------------------------------------------------------
+# Panel LED layouts
+# ---------------------------------------------------------------------------
+# The wire protocol addresses pixels linearly: index = y*16 + x. Where each
+# index physically lands depends on how that panel's matrix is wired and
+# mounted — it differs per panel. A layout maps a logical position (x, y as
+# seen facing the panel, (0,0) = top-left, y downward) to the linear index
+# the slave expects.
+
+def _row_major(x, y):
+    return y * PANEL_SIZE + x
+
+
+def _row_snake(x, y):
+    return y * PANEL_SIZE + (x if y % 2 == 0 else PANEL_SIZE - 1 - x)
+
+
+def _col_major(x, y):
+    return x * PANEL_SIZE + y
+
+
+def _col_snake(x, y):
+    return x * PANEL_SIZE + (y if x % 2 == 0 else PANEL_SIZE - 1 - y)
+
+
+_BASE_LAYOUTS = {
+    "row-major": _row_major,
+    "row-snake": _row_snake,
+    "col-major": _col_major,
+    "col-snake": _col_snake,
+}
+
+
+# Mounting transforms: rot-N = panel rotated N degrees clockwise relative to
+# the viewer; flip-h = mirrored left-right.
+def _rot90(f):  return lambda x, y: f(y, PANEL_SIZE - 1 - x)
+def _rot180(f): return lambda x, y: f(PANEL_SIZE - 1 - x, PANEL_SIZE - 1 - y)
+def _rot270(f): return lambda x, y: f(PANEL_SIZE - 1 - y, x)
+def _fliph(f):  return lambda x, y: f(PANEL_SIZE - 1 - x, y)
+
+
+def _build_layouts():
+    transforms = [
+        ("", lambda f: f),
+        (" rot-90", _rot90),
+        (" rot-180", _rot180),
+        (" rot-270", _rot270),
+        (" flip-h", _fliph),
+        (" flip-h rot-90", lambda f: _rot90(_fliph(f))),
+        (" flip-h rot-180", lambda f: _rot180(_fliph(f))),
+        (" flip-h rot-270", lambda f: _rot270(_fliph(f))),
+    ]
+    return {base + t: tfn(fn)
+            for base, fn in _BASE_LAYOUTS.items()
+            for t, tfn in transforms}
+
+
+LAYOUTS = _build_layouts()
+
+# Layout name per panel (list index = panel ID). Run `./ledmaker.py PORT
+# --identify` on a panel to discover its layout, then update this table.
+PANEL_LAYOUTS = [
+    "row-snake",   # panel 0: snake starting top-left (user-reported)
+    "row-major",   # panel 1
+    "row-major",   # panel 2
+    "row-major",   # panel 3
+    "row-major",   # panel 4
+]
+
+
+def build_to_index(layout_fn):
+    """Table mapping logical (x, y) -> linear pixel index."""
+    return [[layout_fn(x, y) for x in range(PANEL_SIZE)]
+            for y in range(PANEL_SIZE)]
+
+
+def invert_table(to_index):
+    """Table mapping linear pixel index -> logical (x, y)."""
+    to_xy = [None] * NUM_LEDS
+    for y in range(PANEL_SIZE):
+        for x in range(PANEL_SIZE):
+            to_xy[to_index[y][x]] = (x, y)
+    return to_xy
 
 NOREPLY_DIAG = """\
 ERROR: the master does not reply to commands, so pixel confirmations
@@ -105,8 +196,16 @@ def send_command(ser, cmd, delay, retries=MAX_RETRIES):
     return status
 
 
-def set_pixel(ser, panel, x, y, on, delay, retries):
-    return send_command(ser, f"x {panel} {x} {y} {1 if on else 0}", delay, retries)
+def set_index(ser, panel, idx, on, delay, retries):
+    """Set a pixel by raw linear index (no layout mapping)."""
+    return send_command(
+        ser, f"x {panel} {idx % PANEL_SIZE} {idx // PANEL_SIZE} {1 if on else 0}",
+        delay, retries)
+
+
+def set_pixel(ser, panel, to_index, x, y, on, delay, retries):
+    """Set the pixel at logical (x, y), translated by the panel's layout."""
+    return set_index(ser, panel, to_index[y][x], on, delay, retries)
 
 
 def prompt_int(prompt, default, low, high):
@@ -132,6 +231,68 @@ def prompt_bool(prompt, default):
     return value.startswith("y")
 
 
+def prompt_choice(prompt, choices):
+    """Ask for one of `choices`; empty input returns None (skip)."""
+    value = input(prompt).strip().lower()
+    if value == "":
+        return None
+    if value in choices:
+        return value
+    print(f"  (not one of {'/'.join(choices)} — skipped)")
+    return None
+
+
+IDENTIFY_LANDMARKS = (0, 1, 15, 16, 255)
+
+
+def run_identify(ser, panel, delay, retries):
+    """Light landmark indices and deduce the panel's layout from answers.
+
+    Returns a list of matching layout names ([] if none, None on abort).
+    """
+    print("\nIdentify mode — face the physical panel upright.")
+    print("Landmark pixels will light one at a time; note WHERE each appears.\n")
+    input("Press Enter to begin...")
+    for idx in IDENTIFY_LANDMARKS:
+        if set_index(ser, panel, idx, True, delay, retries) != "ok":
+            print("  ABORT: panel did not confirm a command.")
+            return None
+        input(f"  index {idx:3} is lit — note its position, then Enter...")
+        set_index(ser, panel, idx, False, delay, retries)
+
+    corners = {"tl": (0, 0), "tr": (PANEL_SIZE - 1, 0),
+               "bl": (0, PANEL_SIZE - 1), "br": (PANEL_SIZE - 1, PANEL_SIZE - 1)}
+    directions = {"right": (1, 0), "left": (-1, 0), "down": (0, 1), "up": (0, -1)}
+
+    print("\nAnswer from your notes (Enter = don't know):")
+    c0 = prompt_choice("  index 0 was at which corner? [tl/tr/bl/br]: ", corners)
+    d1 = prompt_choice("  index 1 was which way from index 0? [right/left/down/up]: ",
+                       directions)
+    adj = prompt_choice("  were index 15 and 16 next to each other? [y/n]: ", ("y", "n"))
+    c255 = prompt_choice("  index 255 was at which corner? [tl/tr/bl/br]: ", corners)
+
+    matches = []
+    for name, fn in LAYOUTS.items():
+        to_xy = invert_table(build_to_index(fn))
+        if c0 and to_xy[0] != corners[c0]:
+            continue
+        if d1:
+            x0, y0 = to_xy[0]
+            x1, y1 = to_xy[1]
+            if (x1 - x0, y1 - y0) != directions[d1]:
+                continue
+        if adj is not None:
+            x15, y15 = to_xy[15]
+            x16, y16 = to_xy[16]
+            adjacent = abs(x15 - x16) + abs(y15 - y16) == 1
+            if adjacent != (adj == "y"):
+                continue
+        if c255 and to_xy[NUM_LEDS - 1] != corners[c255]:
+            continue
+        matches.append(name)
+    return matches
+
+
 def draw_summary(bitmap):
     """Print a 16x16 ASCII view of the chosen pattern."""
     print("Pattern summary:")
@@ -147,7 +308,7 @@ def preflight(ser, panel, delay, retries):
     so it has no side effects beyond the planned clear.
     """
     print("Checking that the master confirms commands...")
-    status = set_pixel(ser, panel, 0, 0, False, delay, retries)
+    status = set_index(ser, panel, 0, False, delay, retries)
     if status == "ok":
         print("Master link OK.")
         return True
@@ -158,12 +319,12 @@ def preflight(ser, panel, delay, retries):
 def clear_panel(ser, panel, delay, retries):
     """Set every pixel off, requiring an OK for each one."""
     print("Clearing panel (256 pixels, this takes ~20 s)...")
-    for y in range(PANEL_SIZE):
-        print(f"  row {y + 1}/{PANEL_SIZE}")
-        for x in range(PANEL_SIZE):
-            if set_pixel(ser, panel, x, y, False, delay, retries) != "ok":
-                print(f"  ABORT: panel did not confirm clear of pixel ({x},{y})")
-                return False
+    for idx in range(NUM_LEDS):
+        if idx % PANEL_SIZE == 0:
+            print(f"  row {idx // PANEL_SIZE + 1}/{PANEL_SIZE}")
+        if set_index(ser, panel, idx, False, delay, retries) != "ok":
+            print(f"  ABORT: panel did not confirm clear of index {idx}")
+            return False
     return True
 
 
@@ -175,10 +336,20 @@ def main():
                         help=f"Seconds to wait after each command (default {DEFAULT_DELAY})")
     parser.add_argument("--retries", type=int, default=MAX_RETRIES,
                         help=f"Attempts per pixel before giving up (default {MAX_RETRIES})")
+    parser.add_argument("--identify", action="store_true",
+                        help="Discover the panel's LED layout instead of editing a pattern")
     args = parser.parse_args()
 
     panel = prompt_int("Panel ID (0-4) [0]: ", 0, 0, NUM_PANELS - 1)
-    slot = prompt_int("Save to slot (0-3) [0]: ", 0, 0, SLOTS - 1)
+    layout_name = PANEL_LAYOUTS[panel]
+    if layout_name not in LAYOUTS:
+        print(f"ERROR: unknown layout '{layout_name}' for panel {panel}.")
+        print("Fix PANEL_LAYOUTS at the top of this file (names are in LAYOUTS).")
+        sys.exit(1)
+    to_index = build_to_index(LAYOUTS[layout_name])
+    slot = 0
+    if not args.identify:
+        slot = prompt_int("Save to slot (0-3) [0]: ", 0, 0, SLOTS - 1)
 
     # The 32U4 (Pro Micro) only transmits USB serial data once the host has
     # asserted DTR/RTS (its CDC "line state"); incoming commands work either
@@ -199,21 +370,38 @@ def main():
         if not preflight(ser, panel, args.delay, args.retries):
             sys.exit(1)
 
+        if args.identify:
+            matches = run_identify(ser, panel, args.delay, args.retries)
+            if matches is None:
+                sys.exit(1)
+            if not matches:
+                print("\nNo known layout matches those observations.")
+                print("Note exactly where indices 0, 1, 15, 16, 255 lit and")
+                print("ask for a matching layout to be added to LAYOUTS.")
+                sys.exit(1)
+            print(f"\nMatching layout(s): {', '.join(matches)}")
+            print("Set this near the top of ledmaker.py:")
+            print(f'    PANEL_LAYOUTS[{panel}] = "{matches[0]}"')
+            sys.exit(0)
+
         if not clear_panel(ser, panel, args.delay, args.retries):
             sys.exit(1)
 
-        print(f"Configuring panel {panel}. 'y' = on, anything else = off.")
+        print(f"Configuring panel {panel} (layout '{layout_name}').")
+        print("'y' = on, anything else = off.")
         bitmap = [[False for _ in range(PANEL_SIZE)] for _ in range(PANEL_SIZE)]
         for y in range(PANEL_SIZE):
             for x in range(PANEL_SIZE):
                 # Light the pixel so the user can see which one is asked about.
-                if set_pixel(ser, panel, x, y, True, args.delay, args.retries) != "ok":
+                if set_pixel(ser, panel, to_index, x, y, True,
+                             args.delay, args.retries) != "ok":
                     print(f"  WARNING: could not light preview pixel ({x},{y})")
 
                 on = prompt_bool(f"Pixel ({x:2},{y:2}) on? [y/N]: ", False)
 
                 # Apply the user's final choice (idempotent when it is 'on').
-                if set_pixel(ser, panel, x, y, on, args.delay, args.retries) != "ok":
+                if set_pixel(ser, panel, to_index, x, y, on,
+                             args.delay, args.retries) != "ok":
                     print(f"  WARNING: panel did not confirm pixel ({x},{y}) = "
                           f"{'on' if on else 'off'} — panel state may differ")
                 bitmap[y][x] = on
