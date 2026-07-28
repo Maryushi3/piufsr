@@ -37,12 +37,15 @@ MAX_RETRIES = 3
 NOREPLY_DIAG = """\
 ERROR: the master does not reply to commands, so pixel confirmations
 cannot be honored. Check, in order:
-  1. The Pro Micro is flashed with the CURRENT master.ino — older
-     masters never reply to 'x' commands. Reflash it and retry.
-     (The slaves do NOT need reflashing.)
-  2. No other program has the port open (serial monitor, cal.py,
-     cal_web; on Linux also ModemManager / brltty can steal the port).
-  3. You passed the correct serial port."""
+  1. No other program has the port open right now — CLOSE the serial
+     monitor first (also cal.py / cal_web; on Linux, ModemManager or
+     brltty can steal the port). Two readers split the incoming data.
+  2. The Pro Micro is flashed with the CURRENT master.ino — older
+     masters never reply to 'x' commands.
+  3. You passed the correct serial port.
+Note: this script asserts DTR/RTS at open, which the 32U4 needs before
+it transmits anything. If the run above said "no data received at all"
+despite all of the above, please share the printed output."""
 
 FAIL_DIAG = """\
 ERROR: the master replies, but the slave does not confirm (FAIL).
@@ -53,19 +56,27 @@ matches the panel ID you chose (use the master's 'i' bus scan)."""
 def read_reply(ser):
     """Wait for one command reply from the master.
 
-    Returns True for OK, False for FAIL, None on timeout.
+    Returns (True, ignored) for OK, (False, ignored) for FAIL, or
+    (None, ignored) on timeout. `ignored` holds the non-reply lines seen
+    while waiting, for diagnostics.
     """
+    ignored = []
     deadline = time.time() + REPLY_TIMEOUT
     while time.time() < deadline:
-        line = ser.readline().decode("utf-8", errors="replace").strip()
+        raw = ser.readline()
+        if not raw:
+            time.sleep(0.01)
+            continue
+        line = raw.decode("utf-8", errors="replace").strip()
         if line.startswith(">"):
             line = line[1:].strip()  # strip the master's glued-on prompt
         if line.endswith("OK"):
-            return True
+            return True, ignored
         if line.endswith("FAIL"):
-            return False
+            return False, ignored
         # Anything else (stream lines, banner, help) is not a reply.
-    return None
+        ignored.append(line)
+    return None, ignored
 
 
 def send_command(ser, cmd, delay, retries=MAX_RETRIES):
@@ -79,12 +90,17 @@ def send_command(ser, cmd, delay, retries=MAX_RETRIES):
         ser.write((cmd + "\n").encode())
         ser.flush()
         time.sleep(delay)
-        resp = read_reply(ser)
+        resp, ignored = read_reply(ser)
         if resp is True:
             return "ok"
         if resp is False:
             status = "fail"
         print(f"  ! '{cmd}' attempt {attempt}: {'timeout' if resp is None else 'FAIL'}")
+        if attempt == retries:
+            if ignored:
+                print(f"  (received but not a reply: {ignored[:5]})")
+            elif resp is None:
+                print("  (no data received from the master at all)")
         time.sleep(0.1)
     return status
 
@@ -164,7 +180,18 @@ def main():
     panel = prompt_int("Panel ID (0-4) [0]: ", 0, 0, NUM_PANELS - 1)
     slot = prompt_int("Save to slot (0-3) [0]: ", 0, 0, SLOTS - 1)
 
-    ser = serial.Serial(args.port, args.baud, timeout=REPLY_TIMEOUT)
+    # The 32U4 (Pro Micro) only transmits USB serial data once the host has
+    # asserted DTR/RTS (its CDC "line state"); incoming commands work either
+    # way. Some pyserial/platform combos don't assert these by default, which
+    # silently swallows every master reply while commands still get through.
+    # Setting dtr/rts before open() applies them atomically at open.
+    ser = serial.Serial()
+    ser.port = args.port
+    ser.baudrate = args.baud
+    ser.timeout = REPLY_TIMEOUT
+    ser.dtr = True
+    ser.rts = True
+    ser.open()
     time.sleep(2)  # let the master settle after opening the port
     ser.reset_input_buffer()
 
