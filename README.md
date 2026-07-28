@@ -272,7 +272,8 @@ source venv/bin/activate
 
 The script asks for a panel (0-4, default 0) and a save slot (0-3, default 0).
 It clears every pixel, then lights each pixel one at a time and asks `y/N` to
-turn it on. After the last pixel it saves the bitmap to the chosen panel/slot.
-The master replies `OK`/`FAIL` after each pixel so the script can retry on I2C
-errors; a small default delay is inserted between commands to avoid overrunning
-the panel while it updates the WS2812 matrix.
+turn it on. After the last pixel it saves the bitmap to the chosen panel/slot
+(`w <panel> <slot>`). Every command must be confirmed by the master's
+`Panel <p> OK` reply before the script moves on (with retries on `FAIL` or
+timeout); the master's `> ` prompt fragments and any streaming output are
+ignored while waiting for a reply.
