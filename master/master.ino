@@ -22,7 +22,6 @@ static uint8_t panelFailCount[NUM_PANELS];
 static unsigned long lastBusRecoverMs;
 static unsigned long lastSendUs;
 static unsigned long lastIterationUs;
-static bool firstLoop;
 static bool calibrating;
 static unsigned long calPrintUs;
 
@@ -152,12 +151,25 @@ static bool twiProbe(uint8_t addr) {
 
 /*===========================================================================*/
 
+// Last state actually sent to the host. Reports are only written when the
+// state changes, because Gamepad.write() blocks up to ~250 ms whenever the
+// host is not polling the HID interrupt endpoint — and hosts only poll a
+// gamepad while some program has it open. Writing unconditionally every loop
+// would slow the whole master to a few Hz until a game/tester opens the
+// device.
+static bool gamepadReported[NUM_PANELS];
+static bool gamepadDirty;
+
 static void updateGamepad() {
   for (int p = 0; p < NUM_PANELS; p++) {
-    if (panelActive[p]) {
-      Gamepad.press(p + 1);
-    } else {
-      Gamepad.release(p + 1);
+    if (panelActive[p] != gamepadReported[p]) {
+      gamepadReported[p] = panelActive[p];
+      if (panelActive[p]) {
+        Gamepad.press(p + 1);
+      } else {
+        Gamepad.release(p + 1);
+      }
+      gamepadDirty = true;
     }
   }
 }
@@ -218,11 +230,13 @@ static void handleScan();
 void setup() {
   Serial.begin(kSerialBaud);
   twiInit();
-  for (int p = 0; p < NUM_PANELS; p++) panelActive[p] = prevPanelActive[p] = false;
+  for (int p = 0; p < NUM_PANELS; p++) {
+    panelActive[p] = prevPanelActive[p] = gamepadReported[p] = false;
+  }
   Gamepad.begin();
+  gamepadDirty = true;  // send the initial all-released state once
   lastSendUs = 0;
   lastIterationUs = 0;
-  firstLoop = true;
   calibrating = false;
   calPrintUs = 0;
   for (int p = 0; p < NUM_PANELS; p++) panelFailCount[p] = 0;
@@ -240,9 +254,12 @@ void loop() {
   pollAllPanels();
   handleLEDTransitions();
 
-  if (firstLoop || (now - lastSendUs + lastIterationUs >= kSendIntervalUs)) {
+  if (now - lastSendUs + lastIterationUs >= kSendIntervalUs) {
     updateGamepad();
-    Gamepad.write();
+    if (gamepadDirty) {
+      Gamepad.write();
+      gamepadDirty = false;
+    }
     lastSendUs = now;
   }
 
@@ -258,9 +275,6 @@ void loop() {
 
   processSerial();
 
-  if (firstLoop) {
-    firstLoop = false;
-  }
   lastIterationUs = micros() - now;
 }
 
