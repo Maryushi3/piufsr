@@ -1,11 +1,37 @@
 #!/usr/bin/env python3
-import sys
-import serial
+"""Browser calibration UI for the PIUFSR master.
+
+Binds to localhost by default. /cmd can zero and permanently save calibration
+to every slave's EEPROM, so exposing it on a network means anyone who can
+reach the port can overwrite the pad's calibration. Pass --host explicitly
+(and only on a trusted network) if you really want that.
+"""
+import argparse
+import json
+import math
+import random
 import threading
 import time
-import random
-import math
-from flask import Flask, Response, request
+
+import serial
+from flask import Flask, Response, jsonify, request
+
+
+def _is_int(x):
+    """int, but not bool — bool is an int subclass, so {"idx": true} would
+    otherwise validate and put the literal 's True 5' on the wire."""
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+NUM_PANELS = 5
+FSRS_PER_PANEL = 4
+NUM_SENSORS = NUM_PANELS * FSRS_PER_PANEL
+DEFAULT_BAUD = 115200
+DEFAULT_HTTP_PORT = 8765
+# Matches the slave firmware's kDefaultThreshold, so a UI that cannot reach
+# the hardware still shows a plausible value instead of a made-up one.
+FIRMWARE_DEFAULT_THRESHOLD = 125
+THRESHOLD_TIMEOUT = 3.0
 
 HTML = """\
 <!DOCTYPE html>
@@ -100,47 +126,47 @@ h1 { color: #ff6b6b; margin: 0; font-size: 22px; letter-spacing: 2px; }
 
 <!-- TL = div2, sensors 4-7: L=4 R=5 U=6 D=7 -->
 <div class="panel div2">
-  <div class="edge-up">  <span class="side">U</span><span class="v" id="v6">000</span><input type="range" class="sl-h" id="s6" min="0" max="255" value="50"><span class="tv" id="t6">050</span></div>
-  <div class="edge-l">  <span class="side">L</span><span class="v" id="v4">000</span><input type="range" class="sl-v" id="s4" min="0" max="255" value="50"><span class="tv" id="t4">050</span></div>
+  <div class="edge-up">  <span class="side">U</span><span class="v" id="v6">000</span><input type="range" class="sl-h" id="s6" min="0" max="255" value="125"><span class="tv" id="t6">125</span></div>
+  <div class="edge-l">  <span class="side">L</span><span class="v" id="v4">000</span><input type="range" class="sl-v" id="s4" min="0" max="255" value="125"><span class="tv" id="t4">125</span></div>
   <div class="mid"><span class="label">T.LFT P1</span></div>
-  <div class="edge-r">  <span class="side">R</span><span class="v" id="v5">000</span><input type="range" class="sl-v" id="s5" min="0" max="255" value="50"><span class="tv" id="t5">050</span></div>
-  <div class="edge-down"><span class="side">D</span><span class="v" id="v7">000</span><input type="range" class="sl-h" id="s7" min="0" max="255" value="50"><span class="tv" id="t7">050</span></div>
+  <div class="edge-r">  <span class="side">R</span><span class="v" id="v5">000</span><input type="range" class="sl-v" id="s5" min="0" max="255" value="125"><span class="tv" id="t5">125</span></div>
+  <div class="edge-down"><span class="side">D</span><span class="v" id="v7">000</span><input type="range" class="sl-h" id="s7" min="0" max="255" value="125"><span class="tv" id="t7">125</span></div>
 </div>
 
 <!-- TR = div4, sensors 12-15: L=12 R=13 U=14 D=15 -->
 <div class="panel div4">
-  <div class="edge-up">  <span class="side">U</span><span class="v" id="v14">000</span><input type="range" class="sl-h" id="s14" min="0" max="255" value="50"><span class="tv" id="t14">050</span></div>
-  <div class="edge-l">  <span class="side">L</span><span class="v" id="v12">000</span><input type="range" class="sl-v" id="s12" min="0" max="255" value="50"><span class="tv" id="t12">050</span></div>
+  <div class="edge-up">  <span class="side">U</span><span class="v" id="v14">000</span><input type="range" class="sl-h" id="s14" min="0" max="255" value="125"><span class="tv" id="t14">125</span></div>
+  <div class="edge-l">  <span class="side">L</span><span class="v" id="v12">000</span><input type="range" class="sl-v" id="s12" min="0" max="255" value="125"><span class="tv" id="t12">125</span></div>
   <div class="mid"><span class="label">T.RGT P3</span></div>
-  <div class="edge-r">  <span class="side">R</span><span class="v" id="v13">000</span><input type="range" class="sl-v" id="s13" min="0" max="255" value="50"><span class="tv" id="t13">050</span></div>
-  <div class="edge-down"><span class="side">D</span><span class="v" id="v15">000</span><input type="range" class="sl-h" id="s15" min="0" max="255" value="50"><span class="tv" id="t15">050</span></div>
+  <div class="edge-r">  <span class="side">R</span><span class="v" id="v13">000</span><input type="range" class="sl-v" id="s13" min="0" max="255" value="125"><span class="tv" id="t13">125</span></div>
+  <div class="edge-down"><span class="side">D</span><span class="v" id="v15">000</span><input type="range" class="sl-h" id="s15" min="0" max="255" value="125"><span class="tv" id="t15">125</span></div>
 </div>
 
 <!-- C = div3, sensors 8-11: L=8 R=9 U=10 D=11 -->
 <div class="panel div3">
-  <div class="edge-up">  <span class="side">U</span><span class="v" id="v10">000</span><input type="range" class="sl-h" id="s10" min="0" max="255" value="50"><span class="tv" id="t10">050</span></div>
-  <div class="edge-l">  <span class="side">L</span><span class="v" id="v8">000</span><input type="range" class="sl-v" id="s8" min="0" max="255" value="50"><span class="tv" id="t8">050</span></div>
+  <div class="edge-up">  <span class="side">U</span><span class="v" id="v10">000</span><input type="range" class="sl-h" id="s10" min="0" max="255" value="125"><span class="tv" id="t10">125</span></div>
+  <div class="edge-l">  <span class="side">L</span><span class="v" id="v8">000</span><input type="range" class="sl-v" id="s8" min="0" max="255" value="125"><span class="tv" id="t8">125</span></div>
   <div class="mid"><span class="label">CENTER P2</span></div>
-  <div class="edge-r">  <span class="side">R</span><span class="v" id="v9">000</span><input type="range" class="sl-v" id="s9" min="0" max="255" value="50"><span class="tv" id="t9">050</span></div>
-  <div class="edge-down"><span class="side">D</span><span class="v" id="v11">000</span><input type="range" class="sl-h" id="s11" min="0" max="255" value="50"><span class="tv" id="t11">050</span></div>
+  <div class="edge-r">  <span class="side">R</span><span class="v" id="v9">000</span><input type="range" class="sl-v" id="s9" min="0" max="255" value="125"><span class="tv" id="t9">125</span></div>
+  <div class="edge-down"><span class="side">D</span><span class="v" id="v11">000</span><input type="range" class="sl-h" id="s11" min="0" max="255" value="125"><span class="tv" id="t11">125</span></div>
 </div>
 
 <!-- BL = div1, sensors 0-3: L=0 R=1 U=2 D=3 -->
 <div class="panel div1">
-  <div class="edge-up">  <span class="side">U</span><span class="v" id="v2">000</span><input type="range" class="sl-h" id="s2" min="0" max="255" value="50"><span class="tv" id="t2">050</span></div>
-  <div class="edge-l">  <span class="side">L</span><span class="v" id="v0">000</span><input type="range" class="sl-v" id="s0" min="0" max="255" value="50"><span class="tv" id="t0">050</span></div>
+  <div class="edge-up">  <span class="side">U</span><span class="v" id="v2">000</span><input type="range" class="sl-h" id="s2" min="0" max="255" value="125"><span class="tv" id="t2">125</span></div>
+  <div class="edge-l">  <span class="side">L</span><span class="v" id="v0">000</span><input type="range" class="sl-v" id="s0" min="0" max="255" value="125"><span class="tv" id="t0">125</span></div>
   <div class="mid"><span class="label">B.LFT P0</span></div>
-  <div class="edge-r">  <span class="side">R</span><span class="v" id="v1">000</span><input type="range" class="sl-v" id="s1" min="0" max="255" value="50"><span class="tv" id="t1">050</span></div>
-  <div class="edge-down"><span class="side">D</span><span class="v" id="v3">000</span><input type="range" class="sl-h" id="s3" min="0" max="255" value="50"><span class="tv" id="t3">050</span></div>
+  <div class="edge-r">  <span class="side">R</span><span class="v" id="v1">000</span><input type="range" class="sl-v" id="s1" min="0" max="255" value="125"><span class="tv" id="t1">125</span></div>
+  <div class="edge-down"><span class="side">D</span><span class="v" id="v3">000</span><input type="range" class="sl-h" id="s3" min="0" max="255" value="125"><span class="tv" id="t3">125</span></div>
 </div>
 
 <!-- BR = div5, sensors 16-19: L=16 R=17 U=18 D=19 -->
 <div class="panel div5">
-  <div class="edge-up">  <span class="side">U</span><span class="v" id="v18">000</span><input type="range" class="sl-h" id="s18" min="0" max="255" value="50"><span class="tv" id="t18">050</span></div>
-  <div class="edge-l">  <span class="side">L</span><span class="v" id="v16">000</span><input type="range" class="sl-v" id="s16" min="0" max="255" value="50"><span class="tv" id="t16">050</span></div>
+  <div class="edge-up">  <span class="side">U</span><span class="v" id="v18">000</span><input type="range" class="sl-h" id="s18" min="0" max="255" value="125"><span class="tv" id="t18">125</span></div>
+  <div class="edge-l">  <span class="side">L</span><span class="v" id="v16">000</span><input type="range" class="sl-v" id="s16" min="0" max="255" value="125"><span class="tv" id="t16">125</span></div>
   <div class="mid"><span class="label">B.RGT P4</span></div>
-  <div class="edge-r">  <span class="side">R</span><span class="v" id="v17">000</span><input type="range" class="sl-v" id="s17" min="0" max="255" value="50"><span class="tv" id="t17">050</span></div>
-  <div class="edge-down"><span class="side">D</span><span class="v" id="v19">000</span><input type="range" class="sl-h" id="s19" min="0" max="255" value="50"><span class="tv" id="t19">050</span></div>
+  <div class="edge-r">  <span class="side">R</span><span class="v" id="v17">000</span><input type="range" class="sl-v" id="s17" min="0" max="255" value="125"><span class="tv" id="t17">125</span></div>
+  <div class="edge-down"><span class="side">D</span><span class="v" id="v19">000</span><input type="range" class="sl-h" id="s19" min="0" max="255" value="125"><span class="tv" id="t19">125</span></div>
 </div>
 
 </div>
@@ -154,15 +180,18 @@ h1 { color: #ff6b6b; margin: 0; font-size: 22px; letter-spacing: 2px; }
   <button onclick="allThr(75)">75</button>
   <button onclick="allThr(100)">100</button>
   <button onclick="allThr(150)">150</button>
-  <span id="global-row">All <input type="range" id="global-sl" min="0" max="255" value="50"><span id="global-val" style="color:#eee;min-width:24px;text-align:center;font-size:12px">50</span></span>
+  <span id="global-row">All <input type="range" id="global-sl" min="0" max="255" value="125"><span id="global-val" style="color:#eee;min-width:24px;text-align:center;font-size:12px">125</span></span>
   <button class="danger" onclick="doCmd('zero')">Zero</button>
   <button class="danger" onclick="doCmd('save')">Save</button>
+  <button onclick="doCmd('refresh')">Reload thr</button>
 </div>
 
 <div id="status"><span class="dot off" id="dot"></span><span id="st">Waiting...</span></div>
 
 <script>
-var thrs = new Array(20).fill(50);
+var N = 20;
+var thrs = new Array(N).fill(125);
+var thrSeq = -1;
 var barFill = document.getElementById('bar-fill');
 var dot = document.getElementById('dot');
 var st = document.getElementById('st');
@@ -171,7 +200,26 @@ var globalVal = document.getElementById('global-val');
 
 function p3(n) { return n < 100 ? (n < 10 ? '  ' + n : ' ' + n) : '' + n; }
 
-for (var i = 0; i < 20; i++) {
+function post(body) {
+  fetch('/cmd', {method:'POST', headers:{'Content-Type':'application/json'},
+                 body:JSON.stringify(body)});
+}
+
+function showThr(idx, v) {
+  thrs[idx] = v;
+  document.getElementById('t' + idx).textContent = p3(v);
+  document.getElementById('s' + idx).value = v;
+}
+
+// Thresholds come from the firmware, not from the markup, so the UI can never
+// claim a value the slaves are not using.
+function applyThresholds(t) {
+  for (var i = 0; i < N; i++) showThr(i, t[i]);
+  var allSame = t.every(function(x) { return x === t[0]; });
+  if (allSame) { globalSl.value = t[0]; globalVal.textContent = t[0]; }
+}
+
+for (var i = 0; i < N; i++) {
   (function(idx) {
     var sl = document.getElementById('s' + idx);
     sl.addEventListener('input', function() {
@@ -179,7 +227,7 @@ for (var i = 0; i < 20; i++) {
       document.getElementById('t' + idx).textContent = p3(this.value);
     });
     sl.addEventListener('change', function() {
-      fetch('/cmd', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({idx:idx, val:thrs[idx]})});
+      post({idx:idx, val:thrs[idx]});
     });
   })(i);
 }
@@ -187,35 +235,32 @@ for (var i = 0; i < 20; i++) {
 globalSl.addEventListener('input', function() {
   var v = parseInt(this.value);
   globalVal.textContent = v;
-  for (var i = 0; i < 20; i++) {
-    thrs[i] = v;
-    document.getElementById('t' + i).textContent = p3(v);
-    document.getElementById('s' + i).value = v;
-  }
+  for (var i = 0; i < N; i++) showThr(i, v);
 });
 globalSl.addEventListener('change', function() {
-  fetch('/cmd', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({all:parseInt(this.value)})});
+  post({all:parseInt(this.value)});
 });
 
 function allThr(v) {
   globalSl.value = v; globalVal.textContent = v;
-  for (var i = 0; i < 20; i++) {
-    thrs[i] = v; document.getElementById('t' + i).textContent = p3(v); document.getElementById('s' + i).value = v;
-  }
-  fetch('/cmd', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({all:v})});
+  for (var i = 0; i < N; i++) showThr(i, v);
+  post({all:v});
 }
 
-function doCmd(c) {
-  fetch('/cmd', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({cmd:c})});
-}
+function doCmd(c) { post({cmd:c}); }
 
 var evt = new EventSource('/stream');
 evt.onmessage = function(e) {
-  var vals = e.data.trim().split(' ').map(Number);
-  if (vals.length !== 20) return;
+  var msg;
+  try { msg = JSON.parse(e.data); } catch (err) { return; }
+  if (!msg.v || msg.v.length !== N) return;
+  if (msg.seq !== thrSeq && msg.t && msg.t.length === N) {
+    thrSeq = msg.seq;
+    applyThresholds(msg.t);
+  }
   var maxVal = 0;
-  for (var i = 0; i < 20; i++) {
-    var v = vals[i]; if (v > maxVal) maxVal = v;
+  for (var i = 0; i < N; i++) {
+    var v = msg.v[i]; if (v > maxVal) maxVal = v;
     var el = document.getElementById('v' + i);
     el.textContent = p3(v);
     el.className = 'v' + (v >= thrs[i] ? ' hit' : v >= thrs[i]/2 ? ' warn' : ' idle');
@@ -223,11 +268,12 @@ evt.onmessage = function(e) {
   var panelIds = ['div1','div2','div3','div4','div5'];
   for (var p = 0; p < 5; p++) {
     var hit = false;
-    for (var s = 0; s < 4; s++) { if (vals[p*4+s] >= thrs[p*4+s]) { hit = true; break; } }
+    for (var s = 0; s < 4; s++) { if (msg.v[p*4+s] >= thrs[p*4+s]) { hit = true; break; } }
     document.getElementById(panelIds[p]).className = 'panel ' + panelIds[p] + (hit ? ' hit' : '');
   }
   barFill.style.width = Math.min(100, maxVal*100/255) + '%';
-  dot.className = 'dot on'; st.textContent = 'Streaming';
+  dot.className = 'dot on';
+  st.textContent = msg.link ? 'Streaming' : 'Streaming (no master)';
 };
 evt.onerror = function() { dot.className = 'dot off'; st.textContent = 'Disconnected'; };
 </script>
@@ -235,53 +281,140 @@ evt.onerror = function() { dot.className = 'dot off'; st.textContent = 'Disconne
 </html>
 """
 
-latest = {"values": [0] * 20, "lock": threading.Lock()}
+state_lock = threading.Lock()
+state = {
+    "values": [0] * NUM_SENSORS,
+    "thresholds": [FIRMWARE_DEFAULT_THRESHOLD] * NUM_SENSORS,
+    # Bumped whenever thresholds change server-side, so a browser knows to
+    # re-sync its sliders without being told twenty times a second.
+    "seq": 0,
+    "link": False,
+}
+
 ser = None
 ser_lock = threading.Lock()
+streaming = False
+# Only the reader thread is allowed to read from the port. A request handler
+# doing its own readline() would compete with it for incoming lines, so
+# "re-read the thresholds" is passed to the reader thread as a request.
+refresh_request = threading.Event()
+
+
+def set_thresholds(values):
+    with state_lock:
+        state["thresholds"] = list(values)
+        state["seq"] += 1
+
+
+def read_thresholds(s):
+    """Ask the master for live thresholds; None if it never answers.
+
+    The master always emits NUM_SENSORS values (0 for an unreachable panel),
+    so the reply can be indexed positionally.
+    """
+    s.write(b"t\n")
+    s.flush()
+    deadline = time.time() + THRESHOLD_TIMEOUT
+    while time.time() < deadline:
+        line = s.readline().decode("utf-8", errors="replace").strip()
+        if line.startswith(">"):
+            line = line[1:].strip()
+        if not line.startswith("t "):
+            continue
+        parts = line.split()
+        if len(parts) != NUM_SENSORS + 1:
+            continue
+        try:
+            return [int(p) for p in parts[1:]]
+        except ValueError:
+            continue
+    return None
 
 
 def serial_reader(port, baud):
-    global ser
+    global ser, streaming
     try:
         s = serial.Serial(port, baud, timeout=1)
         time.sleep(2)
         s.reset_input_buffer()
-        s.write(b"c\n")
-        time.sleep(0.2)
-        s.reset_input_buffer()
     except Exception as e:
         print("Serial open failed:", e)
         return
+
+    thrs = read_thresholds(s)
+    if thrs is None:
+        print("Warning: master did not report thresholds; showing firmware "
+              f"default ({FIRMWARE_DEFAULT_THRESHOLD}).")
+    else:
+        set_thresholds(thrs)
+        print("Thresholds read from hardware:", thrs)
+
+    s.reset_input_buffer()
+    s.write(b"c\n")
+    time.sleep(0.2)
+    s.reset_input_buffer()
     with ser_lock:
         ser = s
+        streaming = True
+    with state_lock:
+        state["link"] = True
+
     while True:
         try:
+            if refresh_request.is_set():
+                refresh_request.clear()
+                # read_thresholds() consumes lines, so it must run on this
+                # thread — the only one that reads the port.
+                again = read_thresholds(s)
+                if again is not None:
+                    set_thresholds(again)
+                    print("-> thresholds re-read:", again)
+                continue
             line = s.readline().decode("utf-8", errors="replace").strip()
             if not line.startswith("c "):
                 continue
             parts = line.split()
-            if len(parts) != 21:
+            if len(parts) != NUM_SENSORS + 1:
                 continue
-            with latest["lock"]:
-                latest["values"] = [int(p) for p in parts[1:]]
+            values = [int(p) for p in parts[1:]]
         except Exception as e:
             print("Serial read error:", e)
             break
+        with state_lock:
+            state["values"] = values
+
     with ser_lock:
         ser = None
+        streaming = False
+    with state_lock:
+        state["link"] = False
     s.close()
 
 
+def stop_streaming():
+    """Toggle the master's 20 Hz stream back off on the way out."""
+    global streaming
+    with ser_lock:
+        s = ser
+        if s and s.is_open and streaming:
+            try:
+                s.write(b"c\n")
+                s.flush()
+            except Exception:
+                pass
+            streaming = False
+
+
 def demo_reader():
-    phase = [random.uniform(0, 2 * math.pi) for _ in range(20)]
+    phase = [random.uniform(0, 2 * math.pi) for _ in range(NUM_SENSORS)]
     t = 0.0
     pattern = [0, 1, 2, 3, 4, 2]
     pat_idx = 0
     hold = 0.0
     while True:
         vals = []
-        for i in range(20):
-            pi = i // 4
+        for i in range(NUM_SENSORS):
+            pi = i // FSRS_PER_PANEL
             base = 18 + int(8 * math.sin(t + phase[i]))
             target = pattern[pat_idx]
             dist = abs(pi - target)
@@ -291,8 +424,8 @@ def demo_reader():
             elif dist == 1:
                 press = int(30 * math.sin(t * 3 + phase[i]))
             vals.append(max(0, min(255, base + press)))
-        with latest["lock"]:
-            latest["values"] = vals
+        with state_lock:
+            state["values"] = vals
         hold += 0.05
         if hold > 1.2:
             hold = 0.0
@@ -312,59 +445,121 @@ def index():
 @app.route("/stream")
 def stream():
     def generate():
-        while True:
-            with latest["lock"]:
-                vals = latest["values"]
-            yield f"data: {' '.join(map(str, vals))}\n\n"
-            time.sleep(0.05)
+        try:
+            while True:
+                with state_lock:
+                    # Copied, not referenced: the lists are mutated in place
+                    # elsewhere and json.dumps runs outside the lock.
+                    payload = {
+                        "v": list(state["values"]),
+                        "t": list(state["thresholds"]),
+                        "seq": state["seq"],
+                        "link": state["link"],
+                    }
+                yield "data: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
+                time.sleep(0.05)
+        except GeneratorExit:
+            # Browser closed the EventSource (tab closed, reload): stop the
+            # generator instead of leaving it spinning until a write fails.
+            return
     return Response(generate(), mimetype="text/event-stream")
 
 
 @app.route("/cmd", methods=["POST"])
 def cmd():
-    data = request.json
-    if not data:
-        return "bad", 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error="expected a JSON object"), 400
+
+    if data.get("cmd") == "refresh":
+        # The reader thread owns the port; ask it to do the round-trip.
+        with ser_lock:
+            if not (ser and ser.is_open):
+                return jsonify(error="no serial link"), 503
+        refresh_request.set()
+        return jsonify(ok=True), 202
+
     with ser_lock:
         s = ser
-        if s and s.is_open:
-            try:
-                if data.get("cmd") == "zero":
-                    s.write(b"o\n")
-                    print("-> zero offsets")
-                elif data.get("cmd") == "save":
-                    s.write(b"s\n")
-                    print("-> save to eeprom")
-                elif "idx" in data and "val" in data:
-                    s.write(f"s {data['idx']} {data['val']}\n".encode())
-                    print(f"-> set thr[{data['idx']}] = {data['val']}")
-                elif "all" in data:
-                    for i in range(20):
-                        s.write(f"s {i} {data['all']}\n".encode())
-                    print(f"-> set all thrs = {data['all']}")
-            except Exception as e:
-                print("Serial write error:", e)
-    return "ok"
+        if not (s and s.is_open):
+            return jsonify(error="no serial link"), 503
+        try:
+            if data.get("cmd") == "zero":
+                s.write(b"o\n")
+                print("-> zero offsets")
+            elif data.get("cmd") == "save":
+                s.write(b"s\n")
+                print("-> save to eeprom")
+            elif "idx" in data and "val" in data:
+                idx, val = data["idx"], data["val"]
+                if not (_is_int(idx) and _is_int(val)
+                        and 0 <= idx < NUM_SENSORS and 0 <= val <= 255):
+                    return jsonify(error="idx 0-19, val 0-255"), 400
+                s.write(f"s {idx} {val}\n".encode())
+                with state_lock:
+                    state["thresholds"][idx] = val
+                    state["seq"] += 1
+                print(f"-> set thr[{idx}] = {val}")
+            elif "all" in data:
+                val = data["all"]
+                if not (_is_int(val) and 0 <= val <= 255):
+                    return jsonify(error="all: 0-255"), 400
+                # One master command, not twenty: the master fans it out as a
+                # single write per panel. Sending 20 `s i v` lines back to back
+                # used to stall the master's poll loop for over a second.
+                s.write(f"a {val}\n".encode())
+                print(f"-> set all thrs = {val}")
+            else:
+                return jsonify(error="unrecognised command"), 400
+            s.flush()
+        except Exception as e:
+            print("Serial write error:", e)
+            return jsonify(error=str(e)), 500
+
+    if "all" in data:
+        set_thresholds([data["all"]] * NUM_SENSORS)
+    return jsonify(ok=True)
 
 
 def main():
-    if len(sys.argv) >= 2 and sys.argv[1] == "--demo":
+    parser = argparse.ArgumentParser(
+        description="PIUFSR browser calibration UI")
+    parser.add_argument("serial_port", nargs="?",
+                        help="Serial port of the Pro Micro master")
+    parser.add_argument("baud", nargs="?", type=int, default=DEFAULT_BAUD)
+    parser.add_argument("--demo", action="store_true",
+                        help="Synthesise readings instead of opening a port")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Interface to bind (default 127.0.0.1). /cmd can "
+                             "overwrite pad calibration and has no auth, so "
+                             "only widen this on a trusted network.")
+    parser.add_argument("--http-port", type=int, default=DEFAULT_HTTP_PORT,
+                        help=f"HTTP port (default {DEFAULT_HTTP_PORT})")
+    args = parser.parse_args()
+
+    if args.demo:
         print("Demo mode")
-        t = threading.Thread(target=demo_reader, daemon=True)
-        t.start()
-        http_port = int(sys.argv[2]) if len(sys.argv) > 2 else 8765
-    elif len(sys.argv) >= 2:
-        port = sys.argv[1]
-        baud = int(sys.argv[2]) if len(sys.argv) > 2 else 115200
-        t = threading.Thread(target=serial_reader, args=(port, baud), daemon=True)
-        t.start()
-        http_port = 8765
+        threading.Thread(target=demo_reader, daemon=True).start()
+    elif args.serial_port:
+        threading.Thread(target=serial_reader,
+                         args=(args.serial_port, args.baud),
+                         daemon=True).start()
     else:
-        print("usage: %s <serial_port> [baud]" % sys.argv[0])
-        print("   or: %s --demo [http_port]" % sys.argv[0])
-        sys.exit(1)
-    print("Listening on http://localhost:%d" % http_port)
-    app.run(host="0.0.0.0", port=http_port, debug=False, use_reloader=False)
+        parser.error("give a serial port, or --demo")
+
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"WARNING: binding {args.host} exposes /cmd, which can zero and "
+              "permanently save this pad's calibration, to anyone who can "
+              "reach this port. There is no authentication.")
+
+    print(f"Listening on http://{args.host}:{args.http_port}")
+    try:
+        app.run(host=args.host, port=args.http_port, debug=False,
+                use_reloader=False, threaded=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_streaming()
 
 
 if __name__ == "__main__":

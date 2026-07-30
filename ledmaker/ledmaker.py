@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Interactive LED pattern maker for PIUFSR panels.
+"""LED pattern tool for PIUFSR panels.
 
-Walks through one panel pixel at a time over the Pro Micro master's USB
+Three ways to get a pattern onto a panel, over the Pro Micro master's USB
 serial port:
-  1. asks for a panel ID (0-4) and a save slot (0-3),
-  2. clears the whole panel pixel by pixel, waiting for the master to
-     confirm each set-pixel command (with retries),
-  3. lights each pixel one at a time and asks whether to keep it on,
-  4. saves the resulting bitmap to the panel's EEPROM slot.
+
+  --load FILE   upload a pattern file in one shot (4 I2C frames, no prompting)
+  (default)     interactive: light each pixel and answer y/N, 256 times
+  --identify    light landmark pixels to discover a panel's matrix layout
 
 Coordinates are LOGICAL: (x, y) as seen facing the panel, (0,0) = top-left,
 y downward. Each panel's LED matrix may be wired/mounted differently, so a
-per-panel layout table (PANEL_LAYOUTS below) translates logical positions
-to the linear pixel index the slave expects. Run with --identify to light
-landmark pixels on a panel and discover its layout.
+per-panel layout table (PANEL_LAYOUTS below) translates logical positions to
+the linear pixel index the slave expects.
+
+Pattern file format: 16 lines of 16 characters. '#', 'X', 'x' or '1' mean on;
+anything else means off. Lines starting with ';' are comments.
 
 Protocol notes:
   Every command is answered with "Panel <p> OK" or "Panel <p> FAIL".
@@ -22,8 +23,9 @@ Protocol notes:
   Calibration stream lines ("c ...") and all other output are ignored.
 
 Usage:
-    python3 ledmaker.py <serial_port> [--baud 115200] [--delay 0.05] [--retries 3]
-    python3 ledmaker.py <serial_port> --identify
+    python3 ledmaker.py <port> [--panel N] [--slot N]
+    python3 ledmaker.py <port> --load pattern.txt [--panel N] [--slot N]
+    python3 ledmaker.py <port> --panel N --identify
 """
 import argparse
 import sys
@@ -35,11 +37,14 @@ NUM_PANELS = 5
 PANEL_SIZE = 16
 NUM_LEDS = PANEL_SIZE * PANEL_SIZE
 SLOTS = 4
+BITMAP_BYTES = NUM_LEDS // 8
 
 DEFAULT_BAUD = 115200
 DEFAULT_DELAY = 0.05   # seconds to wait after each command before reading
 REPLY_TIMEOUT = 1.0    # max seconds to wait for one reply
 MAX_RETRIES = 3
+
+ON_CHARS = "#Xx1"
 
 # ---------------------------------------------------------------------------
 # Panel LED layouts
@@ -101,7 +106,7 @@ def _build_layouts():
 LAYOUTS = _build_layouts()
 
 # Layout name per panel (list index = panel ID). Run `./ledmaker.py PORT
-# --identify` on a panel to discover its layout, then update this table.
+# --panel N --identify` to discover a panel's layout, then update this table.
 PANEL_LAYOUTS = [
     "row-snake",   # panel 0: snake starting top-left (user-reported)
     "row-major",   # panel 1
@@ -124,6 +129,7 @@ def invert_table(to_index):
         for x in range(PANEL_SIZE):
             to_xy[to_index[y][x]] = (x, y)
     return to_xy
+
 
 NOREPLY_DIAG = """\
 ERROR: the master does not reply to commands, so pixel confirmations
@@ -177,7 +183,7 @@ def send_command(ser, cmd, delay, retries=MAX_RETRIES):
     "noreply" (master never answers at all).
     """
     status = "noreply"
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, max(1, retries) + 1):
         ser.write((cmd + "\n").encode())
         ser.flush()
         time.sleep(delay)
@@ -187,7 +193,7 @@ def send_command(ser, cmd, delay, retries=MAX_RETRIES):
         if resp is False:
             status = "fail"
         print(f"  ! '{cmd}' attempt {attempt}: {'timeout' if resp is None else 'FAIL'}")
-        if attempt == retries:
+        if attempt == max(1, retries):
             if ignored:
                 print(f"  (received but not a reply: {ignored[:5]})")
             elif resp is None:
@@ -301,6 +307,42 @@ def draw_summary(bitmap):
     print(f"Total on: {sum(sum(row) for row in bitmap)} / {NUM_LEDS}")
 
 
+def read_pattern_file(path):
+    """Parse a 16x16 pattern file into a logical bitmap. Raises ValueError."""
+    rows = []
+    with open(path, encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.rstrip("\n").rstrip("\r")
+            if line.startswith(";") or line.strip() == "":
+                continue
+            if len(line) < PANEL_SIZE:
+                raise ValueError(
+                    f"{path}:{lineno}: row has {len(line)} chars, need {PANEL_SIZE}")
+            rows.append([c in ON_CHARS for c in line[:PANEL_SIZE]])
+    if len(rows) != PANEL_SIZE:
+        raise ValueError(f"{path}: found {len(rows)} rows, need exactly {PANEL_SIZE}")
+    return rows
+
+
+def write_pattern_file(path, bitmap):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(";  PIUFSR 16x16 pattern ('#' = on)\n")
+        for y in range(PANEL_SIZE):
+            fh.write("".join("#" if bitmap[y][x] else "." for x in range(PANEL_SIZE)))
+            fh.write("\n")
+
+
+def bitmap_to_hex(bitmap, to_index):
+    """Logical bitmap -> 64 hex chars in the panel's linear index space."""
+    data = bytearray(BITMAP_BYTES)
+    for y in range(PANEL_SIZE):
+        for x in range(PANEL_SIZE):
+            if bitmap[y][x]:
+                idx = to_index[y][x]
+                data[idx >> 3] |= 1 << (idx & 7)
+    return data.hex()
+
+
 def preflight(ser, panel, delay, retries):
     """Verify the master confirms commands before doing any real work.
 
@@ -317,39 +359,147 @@ def preflight(ser, panel, delay, retries):
 
 
 def clear_panel(ser, panel, delay, retries):
-    """Set every pixel off, requiring an OK for each one."""
-    print("Clearing panel (256 pixels, this takes ~20 s)...")
-    for idx in range(NUM_LEDS):
-        if idx % PANEL_SIZE == 0:
-            print(f"  row {idx // PANEL_SIZE + 1}/{PANEL_SIZE}")
-        if set_index(ser, panel, idx, False, delay, retries) != "ok":
-            print(f"  ABORT: panel did not confirm clear of index {idx}")
-            return False
+    """Blank the panel's live pattern with a single command."""
+    print("Clearing panel...")
+    if send_command(ser, f"z {panel}", delay, retries) != "ok":
+        print("  ABORT: panel did not confirm the clear.")
+        return False
     return True
 
 
+def save_and_activate(ser, panel, slot, delay, retries):
+    """Save the live pattern to `slot` and make that slot the active one.
+
+    Selecting the slot matters: `w` only stores the bitmap, so without the
+    follow-up the panel would keep showing (and reload at power-up) whichever
+    slot was active before.
+    """
+    print(f"Saving pattern to panel {panel} slot {slot}...")
+    if send_command(ser, f"w {panel} {slot}", delay, retries) != "ok":
+        print("SAVE FAILED — panel did not confirm. Pattern is lost, rerun the tool.")
+        return False
+    if send_command(ser, f"p {panel} {slot}", delay, retries) != "ok":
+        print(f"WARNING: saved to slot {slot}, but the panel did not confirm "
+              f"selecting it. Send 'p {panel} {slot}' from the master console.")
+        return True
+    print("Saved and selected.")
+    return True
+
+
+def run_load(ser, panel, slot, bitmap, to_index, delay, retries):
+    """Upload a whole bitmap, then select the slot so it becomes visible."""
+    hexdata = bitmap_to_hex(bitmap, to_index)
+    print(f"Uploading pattern to panel {panel} slot {slot}...")
+    if send_command(ser, f"u {panel} {slot} {hexdata}", delay, retries) != "ok":
+        print("UPLOAD FAILED — panel did not confirm.")
+        return False
+    if send_command(ser, f"p {panel} {slot}", delay, retries) != "ok":
+        print(f"WARNING: uploaded to slot {slot}, but selecting it was not "
+              f"confirmed. Send 'p {panel} {slot}' from the master console.")
+        return True
+    print("Uploaded and selected.")
+    return True
+
+
+def run_interactive(ser, panel, slot, to_index, layout_name, out_path,
+                    delay, retries):
+    if not clear_panel(ser, panel, delay, retries):
+        return False
+
+    print(f"Configuring panel {panel} (layout '{layout_name}').")
+    print("'y' = on, anything else = off.")
+    bitmap = [[False for _ in range(PANEL_SIZE)] for _ in range(PANEL_SIZE)]
+    for y in range(PANEL_SIZE):
+        for x in range(PANEL_SIZE):
+            # Light the pixel so the user can see which one is asked about.
+            if set_pixel(ser, panel, to_index, x, y, True,
+                         delay, retries) != "ok":
+                print(f"  WARNING: could not light preview pixel ({x},{y})")
+
+            on = prompt_bool(f"Pixel ({x:2},{y:2}) on? [y/N]: ", False)
+
+            # Apply the user's final choice (idempotent when it is 'on').
+            if set_pixel(ser, panel, to_index, x, y, on,
+                         delay, retries) != "ok":
+                print(f"  WARNING: panel did not confirm pixel ({x},{y}) = "
+                      f"{'on' if on else 'off'} — panel state may differ")
+            bitmap[y][x] = on
+
+    # Written before the save round-trip, so an hour of clicking survives even
+    # if the panel stops answering at the last step. A failure here must never
+    # skip the save that follows.
+    if out_path:
+        try:
+            write_pattern_file(out_path, bitmap)
+            print(f"Pattern written to {out_path}")
+        except OSError as e:
+            print(f"WARNING: could not write {out_path}: {e}")
+            print("Pattern (copy this if the save below fails):")
+            draw_summary(bitmap)
+
+    ok = save_and_activate(ser, panel, slot, delay, retries)
+    draw_summary(bitmap)
+    return ok
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Interactive LED pattern maker")
+    parser = argparse.ArgumentParser(description="PIUFSR LED pattern tool")
     parser.add_argument("port", help="Serial port of the Pro Micro master")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Serial baud rate")
     parser.add_argument("--delay", type=float, default=DEFAULT_DELAY,
                         help=f"Seconds to wait after each command (default {DEFAULT_DELAY})")
     parser.add_argument("--retries", type=int, default=MAX_RETRIES,
-                        help=f"Attempts per pixel before giving up (default {MAX_RETRIES})")
+                        help=f"Attempts per command before giving up (default {MAX_RETRIES})")
+    parser.add_argument("--panel", type=int, choices=range(NUM_PANELS),
+                        help="Panel ID (asked interactively when omitted)")
+    parser.add_argument("--slot", type=int, choices=range(SLOTS),
+                        help="EEPROM slot (asked interactively when omitted)")
+    parser.add_argument("--load", metavar="FILE",
+                        help="Upload a 16x16 pattern file instead of prompting")
+    parser.add_argument("--out", metavar="FILE",
+                        help="Also write the interactively drawn pattern here")
     parser.add_argument("--identify", action="store_true",
                         help="Discover the panel's LED layout instead of editing a pattern")
     args = parser.parse_args()
 
-    panel = prompt_int("Panel ID (0-4) [0]: ", 0, 0, NUM_PANELS - 1)
+    if args.identify and args.load:
+        parser.error("--identify and --load are mutually exclusive")
+    if args.out and (args.load or args.identify):
+        parser.error("--out only applies to an interactive session")
+    if args.out:
+        # Checked now, not after 256 prompts: --out exists to protect that work.
+        try:
+            with open(args.out, "a", encoding="utf-8"):
+                pass
+        except OSError as e:
+            parser.error(f"--out {args.out} is not writable: {e}")
+
+    panel = args.panel
+    if panel is None:
+        panel = prompt_int("Panel ID (0-4) [0]: ", 0, 0, NUM_PANELS - 1)
     layout_name = PANEL_LAYOUTS[panel]
     if layout_name not in LAYOUTS:
         print(f"ERROR: unknown layout '{layout_name}' for panel {panel}.")
         print("Fix PANEL_LAYOUTS at the top of this file (names are in LAYOUTS).")
         sys.exit(1)
     to_index = build_to_index(LAYOUTS[layout_name])
+
+    bitmap = None
+    if args.load:
+        # Parsed before the port is opened, so a bad file fails instantly
+        # instead of after touching the hardware.
+        try:
+            bitmap = read_pattern_file(args.load)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: {e}")
+            sys.exit(1)
+
     slot = 0
     if not args.identify:
-        slot = prompt_int("Save to slot (0-3) [0]: ", 0, 0, SLOTS - 1)
+        if args.slot is not None:
+            slot = args.slot
+        else:
+            slot = prompt_int("Save to slot (0-3) [0]: ", 0, 0, SLOTS - 1)
 
     # The 32U4 (Pro Micro) only transmits USB serial data once the host has
     # asserted DTR/RTS (its CDC "line state"); incoming commands work either
@@ -384,36 +534,15 @@ def main():
             print(f'    PANEL_LAYOUTS[{panel}] = "{matches[0]}"')
             sys.exit(0)
 
-        if not clear_panel(ser, panel, args.delay, args.retries):
-            sys.exit(1)
-
-        print(f"Configuring panel {panel} (layout '{layout_name}').")
-        print("'y' = on, anything else = off.")
-        bitmap = [[False for _ in range(PANEL_SIZE)] for _ in range(PANEL_SIZE)]
-        for y in range(PANEL_SIZE):
-            for x in range(PANEL_SIZE):
-                # Light the pixel so the user can see which one is asked about.
-                if set_pixel(ser, panel, to_index, x, y, True,
-                             args.delay, args.retries) != "ok":
-                    print(f"  WARNING: could not light preview pixel ({x},{y})")
-
-                on = prompt_bool(f"Pixel ({x:2},{y:2}) on? [y/N]: ", False)
-
-                # Apply the user's final choice (idempotent when it is 'on').
-                if set_pixel(ser, panel, to_index, x, y, on,
-                             args.delay, args.retries) != "ok":
-                    print(f"  WARNING: panel did not confirm pixel ({x},{y}) = "
-                          f"{'on' if on else 'off'} — panel state may differ")
-                bitmap[y][x] = on
-
-        print(f"Saving pattern to panel {panel} slot {slot}...")
-        if send_command(ser, f"w {panel} {slot}", args.delay, args.retries) == "ok":
-            print("Saved.")
+        if bitmap is not None:
+            draw_summary(bitmap)
+            ok = run_load(ser, panel, slot, bitmap, to_index,
+                          args.delay, args.retries)
         else:
-            print("SAVE FAILED — panel did not confirm. Pattern is lost, rerun the tool.")
+            ok = run_interactive(ser, panel, slot, to_index, layout_name,
+                                 args.out, args.delay, args.retries)
+        if not ok:
             sys.exit(1)
-
-        draw_summary(bitmap)
     except KeyboardInterrupt:
         print("\nAborted by user — nothing was saved.")
         sys.exit(1)

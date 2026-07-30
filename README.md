@@ -21,14 +21,19 @@ editing.
 |------|------|
 | `master/` | Pro Micro firmware (USB gamepad + I2C master + serial console) |
 | `slave/`  | Pro Mini firmware (FSR read + LED render, one per panel) |
-| `ledmaker/` | Interactive tool for drawing per-panel LED patterns |
+| `calibrate/` | Terminal FSR monitor |
+| `cal_web/` | Browser calibration UI (localhost by default) |
+| `ledmaker/` | Draw or upload per-panel LED patterns |
 
 ## Quick start
 
 1. **Flash each slave**: set `I2C_ADDR` (0x10–0x14) in `slave/slave.ino`, upload. Each slave blinks its panel ID on D13 at power-up.
 2. **Flash the master**: install the **HID-Project** library (NicoHood), upload `master/master.ino`.
-3. **Calibrate**: open the serial console (115200), run `o` (zero), tune with `s <i> <v>`, then `s` (save). Send `h` for all commands.
+3. **Calibrate**: open the serial console (115200), run `o` (zero), tune with `s <i> <v>` or `a <v>` (all), then `s` (save). Send `h` for all commands.
 4. **Play**: any program that opens the gamepad (game, `evtest`, joy.cpl) starts input delivery.
-5. **LED patterns**: `ledmaker/setup.sh`, then `./ledmaker.py <port>` — draw patterns pixel by pixel; `--identify` discovers each panel's matrix layout.
+5. **LED patterns**: `ledmaker/setup.sh`, then
+   `venv/bin/python ledmaker.py <port> --load arrow.txt --panel 0 --slot 0`
+   to upload a pattern file, or drop `--load` to draw pixel by pixel.
+   `--identify` discovers a panel's matrix layout.
 
 Full wiring, protocol, and tuning details: **[docs.md](docs.md)**
