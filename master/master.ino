@@ -280,10 +280,15 @@ static void pollAllPanels() {
     // failure rather than consuming garbage.
     bool ok = twiRead(kPanelAddresses[p], buf, 5) && !(buf[0] & 0xF0);
     if (ok) {
+      // Status prints are gated on `if (Serial)`: when no host program holds
+      // the CDC port open, the TX bank is never drained and a print can
+      // block up to the USB stack's ~250 ms send timeout, stalling the loop.
       if (panelFailCount[p] >= kMaxPanelFails) {
-        Serial.print(F("Panel "));
-        Serial.print(p);
-        Serial.println(F(" online"));
+        if (Serial) {
+          Serial.print(F("Panel "));
+          Serial.print(p);
+          Serial.println(F(" online"));
+        }
       }
       panelFailCount[p] = 0;
       panelActive[p] = (buf[0] & 0x0F) != 0;
@@ -299,9 +304,11 @@ static void pollAllPanels() {
         int base = p * FSRS_PER_PANEL;
         for (int i = 0; i < FSRS_PER_PANEL; i++) calValues[base + i] = 0;
         panelActive[p] = false;
-        Serial.print(F("Panel "));
-        Serial.print(p);
-        Serial.println(F(" offline"));
+        if (Serial) {
+          Serial.print(F("Panel "));
+          Serial.print(p);
+          Serial.println(F(" offline"));
+        }
       }
     } else if (twiSdaStuck() &&
                (unsigned long)(millis() - lastBusRecoverMs) >= kBusRecoverIntervalMs) {
@@ -357,12 +364,14 @@ void loop() {
   }
 
   if (calibrating && now - calPrintUs >= 50000) {
-    Serial.print('c');
-    for (int i = 0; i < NUM_SENSORS; i++) {
-      Serial.print(' ');
-      Serial.print(calValues[i]);
+    if (Serial) {  // see pollAllPanels: an undrained port costs ~250 ms/print
+      Serial.print('c');
+      for (int i = 0; i < NUM_SENSORS; i++) {
+        Serial.print(' ');
+        Serial.print(calValues[i]);
+      }
+      Serial.println();
     }
-    Serial.println();
     calPrintUs = now;
   }
 
