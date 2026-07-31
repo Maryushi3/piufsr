@@ -240,6 +240,18 @@ static bool twiProbe(uint8_t addr) {
 static bool gamepadReported[NUM_PANELS];
 static bool gamepadDirty;
 
+// When no program on the PC holds the gamepad open, the HID interrupt
+// endpoint is never drained and Gamepad.write() blocks for the USB stack's
+// ~250 ms send timeout (e.g. every press while you only watch the serial
+// monitor). Detect a stalled write by timing it, then back reporting off for
+// kHidRetryMs — the state keeps accumulating in gamepadDirty and a single
+// probe after the backoff re-arms reporting as soon as something opens the
+// device. While a game is attached, writes take microseconds and this never
+// triggers.
+static unsigned long hidRetryAtMs;
+static const uint16_t kHidRetryMs = 1000;
+static const uint32_t kHidStallUs = 50000;  // 50 ms >> any legit (<1 ms) write
+
 static void updateGamepad() {
   for (int p = 0; p < NUM_PANELS; p++) {
     if (panelActive[p] != gamepadReported[p]) {
@@ -330,6 +342,7 @@ void setup() {
   }
   Gamepad.begin();
   gamepadDirty = true;  // send the initial all-released state once
+  hidRetryAtMs = 0;
   lastSendUs = 0;
   lastIterationUs = 0;
   calibrating = false;
@@ -356,9 +369,14 @@ void loop() {
 
   if (now - lastSendUs + lastIterationUs >= (unsigned long)kSendIntervalUs) {
     updateGamepad();
-    if (gamepadDirty) {
+    if (gamepadDirty && (long)(millis() - hidRetryAtMs) >= 0) {
+      unsigned long wStart = micros();
       Gamepad.write();
-      gamepadDirty = false;
+      if (micros() - wStart >= kHidStallUs) {
+        hidRetryAtMs = millis() + kHidRetryMs;  // endpoint undrained; back off
+      } else {
+        gamepadDirty = false;
+      }
     }
     lastSendUs = now;
   }

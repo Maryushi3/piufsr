@@ -200,6 +200,13 @@ regardless. Note this also means the mat appears unresponsive on the PC until
 *something* has opened the gamepad device — that is host behavior, not a
 fault.
 
+Because HID-Project's `write()` returns `void`, a stalled write is detected
+by **timing** it: anything ≥ 50 ms hit the ~250 ms timeout, so reporting
+backs off for 1 s (state keeps accumulating) and then probes once. While you
+only watch the serial monitor, presses therefore cost at most one hiccup per
+second instead of one per crossing; with a game attached, writes take
+microseconds and the backoff never engages.
+
 A panel going offline forces its button released, so a dead slave cannot leave
 a button stuck down. The matching LED-off write is skipped while the panel is
 offline and re-attempted once it answers again, so a wedged slave doesn't cost
@@ -282,6 +289,10 @@ reloads at power-up. Follow it with `p <panel> <slot>` — that is what
 ## Slave (`slave/slave.ino`)
 
 Board: Pro Mini (ATmega328P, 5V/16MHz).
+
+> **FROZEN FIRMWARE:** all slaves have been flashed for the last time. Do not
+> modify `slave/slave.ino` — the file must stay byte-identical to what runs
+> on the hardware. This document describes the frozen behavior.
 
 **Set `I2C_ADDR` per panel before flashing** (or enable `ADDR_FROM_JUMPERS`).
 
