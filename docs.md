@@ -211,6 +211,41 @@ When enabled (`c` command), sends at 20 Hz:
 c <v0> <v1> ... <v19>
 ```
 
+### Report rate and latency
+
+The nominal rate budget is fixed by constants; the actual rate sags under
+specific hardware conditions (all absorbed without data loss):
+
+| Stage | Budget | Source |
+|-------|--------|--------|
+| Slave FSR sampling | ~1 kHz | 4 × `analogRead` ≈ 440 µs + loop |
+| Master panel poll | ~1 kHz | 5 × 5-byte reads @ 400 kHz ≈ 1 ms/loop (`kI2CClock`) |
+| HID send pacing | ≤ 1 kHz | `kSendIntervalUs = 1000`, on-change only |
+| USB IN polling | 1 kHz | endpoint `bInterval = 1` while a program holds the gamepad open |
+
+What makes it vary: a slave's `FastLED.show()` blacks out its interrupts for
+~8 ms, so a poll that lands on a press/release LED update is clock-stretched
+(the 12 ms timeout absorbs it); heavy bus capacitance slows edges; serial
+prints can block briefly if the host stops draining the port. Press→event
+latency is ~2-5 ms typically; release adds the intentional 40 ms
+`RELEASE_HOLD_MS` (anti-flap). The game itself samples at its own frame rate
+on top of all of this.
+
+**Do not trust browser gamepad testers for rate numbers.** They sample the
+Web Gamepad API at `requestAnimationFrame` cadence (display Hz) and coalesce
+reports between samples; with the on-change-only reporting in this firmware,
+an idle mat correctly sends zero reports, which such sites misread as a low
+rate. Measure instead:
+
+1. **At the source** — serial console, `r` before and after playing a song:
+   prints loops/sec and the worst single-loop time. ~1000 Hz / worst <12 ms
+   means the master is keeping up under real gameplay.
+2. **At the kernel** — `evtest /dev/input/eventX` (Linux) prints every event
+   with its URB-completion timestamp. Rapid taps should show single-digit-ms,
+   evenly spaced event times with no coalesced gaps.
+3. **On the wire** — `usbmon` (e.g. Wireshark's USBPcap/usbmon capture) shows
+   actual URB completions at 1 ms cadence while any app holds the device open.
+
 ### Serial Command Protocol
 
 | Input | Action |
@@ -230,6 +265,7 @@ c <v0> <v1> ... <v19>
 | `b <panel> <val>` | Set panel brightness 0-255 (`0x02`) |
 | `i <panel>` | Trigger identify blink on panel (blinks 1-5 on D13 LED) |
 | `i` | Scan the bus: report which panel addresses ACK |
+| `r` | Print loop-rate stats since the last `r` (or boot), then reset the window |
 | `h` / `?` | Help |
 
 Every panel-directed command is answered with `Panel <p> OK` or
@@ -413,6 +449,15 @@ cd ledmaker
 ./setup.sh
 venv/bin/python ledmaker.py /dev/ttyACM0 --load arrow.txt --panel 0 --slot 0
 ```
+
+Two built-in presets skip the file (useful as panel tests):
+```
+venv/bin/python ledmaker.py /dev/ttyACM0 --fill all     --panel 0 --slot 0
+venv/bin/python ledmaker.py /dev/ttyACM0 --fill center4 --panel 0 --slot 0
+```
+`all` lights every LED (dead-pixel test); `center4` lights only the 4 center
+LEDs in logical coordinates (a quick orientation/layout check). Both upload
+to the slot and select it, exactly like `--load`.
 A pattern file is 16 lines of 16 characters; `#`, `X`, `x` or `1` mean on,
 anything else means off, and lines starting with `;` are comments:
 ```

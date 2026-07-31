@@ -29,6 +29,12 @@ static unsigned long lastIterationUs;
 static bool calibrating;
 static unsigned long calPrintUs;
 
+// Loop-rate statistics for the 'r' command: lets you verify the real poll
+// rate (and worst-case loop time) under gameplay conditions.
+static unsigned long statLoops;
+static uint32_t statMaxLoopUs;
+static unsigned long statStartMs;
+
 /*===========================================================================*/
 /* Forward declarations                                                      */
 /*===========================================================================*/
@@ -62,6 +68,7 @@ static void printHelp();
 static void processSerial();
 static void dispatchCommand(char* buf);
 static void reportPanel(long panel, bool ok);
+static void handleRateStats();
 static void handleZeroOffsets();
 static void printValues();
 static void printThresholds();
@@ -321,6 +328,9 @@ void setup() {
   calibrating = false;
   calPrintUs = 0;
   lastBusRecoverMs = 0;
+  statLoops = 0;
+  statMaxLoopUs = 0;
+  statStartMs = millis();
   Serial.println(F("PIUFSR Master ready."));
   printHelp();
   printPrompt();
@@ -359,6 +369,8 @@ void loop() {
   processSerial();
 
   lastIterationUs = micros() - now;
+  statLoops++;
+  if (lastIterationUs > statMaxLoopUs) statMaxLoopUs = lastIterationUs;
 }
 
 /*===========================================================================*/
@@ -412,6 +424,7 @@ static void printHelp() {
   Serial.println(F("  b <p> <v>  Set panel p brightness to v (0-255)"));
   Serial.println(F("  i <p>      Identify panel p (blink LED)"));
   Serial.println(F("  i          Scan bus for panels"));
+  Serial.println(F("  r          Print loop rate stats (resets the window)"));
   Serial.println(F("  h / ?      This help"));
 }
 
@@ -484,6 +497,7 @@ static void dispatchCommand(char* buf) {
         handleIdentify(args);
       }
       break;
+    case 'r': case 'R': handleRateStats(); break;
     case 'h': case 'H': case '?': printHelp(); break;
     default:
       Serial.println(F("Unknown. Type h for help."));
@@ -497,6 +511,31 @@ static void reportPanel(long panel, bool ok) {
   Serial.print(F("Panel "));
   Serial.print(panel);
   Serial.println(ok ? F(" OK") : F(" FAIL"));
+}
+
+// Prints the loop rate over the window since the last 'r' (or boot), then
+// resets the counters. Use it to sanity-check the real sensor poll rate:
+// ~1000 Hz is the target; the worst-loop figure shows whether anything
+// (I2C timeouts, serial bursts) is stalling the loop.
+static void handleRateStats() {
+  unsigned long elapsedMs = millis() - statStartMs;
+  unsigned long loops = statLoops;
+  uint32_t maxUs = statMaxLoopUs;
+  Serial.print(loops);
+  Serial.print(F(" loops in "));
+  Serial.print(elapsedMs / 1000.0, 1);
+  Serial.print(F(" s = "));
+  if (elapsedMs > 0) {
+    Serial.print(loops / (elapsedMs / 1000.0), 1);
+  } else {
+    Serial.print('?');
+  }
+  Serial.print(F(" Hz, worst loop "));
+  Serial.print(maxUs);
+  Serial.println(F(" us"));
+  statLoops = 0;
+  statMaxLoopUs = 0;
+  statStartMs = millis();
 }
 
 static void handleZeroOffsets() {

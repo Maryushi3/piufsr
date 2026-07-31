@@ -5,6 +5,8 @@ Three ways to get a pattern onto a panel, over the Pro Micro master's USB
 serial port:
 
   --load FILE   upload a pattern file in one shot (4 I2C frames, no prompting)
+  --fill all    upload a built-in preset: every LED on (panel test)
+  --fill center4  or just the 4 center LEDs on (layout/orientation check)
   (default)     interactive: light each pixel and answer y/N, 256 times
   --identify    light landmark pixels to discover a panel's matrix layout
 
@@ -25,6 +27,7 @@ Protocol notes:
 Usage:
     python3 ledmaker.py <port> [--panel N] [--slot N]
     python3 ledmaker.py <port> --load pattern.txt [--panel N] [--slot N]
+    python3 ledmaker.py <port> --fill all [--panel N] [--slot N]
     python3 ledmaker.py <port> --panel N --identify
 """
 import argparse
@@ -343,6 +346,19 @@ def bitmap_to_hex(bitmap, to_index):
     return data.hex()
 
 
+def make_fill_bitmap(kind):
+    """Built-in preset patterns, in logical coordinates."""
+    if kind == "all":
+        return [[True] * PANEL_SIZE for _ in range(PANEL_SIZE)]
+    if kind == "center4":
+        bitmap = [[False] * PANEL_SIZE for _ in range(PANEL_SIZE)]
+        for y in (PANEL_SIZE // 2 - 1, PANEL_SIZE // 2):
+            for x in (PANEL_SIZE // 2 - 1, PANEL_SIZE // 2):
+                bitmap[y][x] = True
+        return bitmap
+    raise ValueError(f"unknown fill preset: {kind}")
+
+
 def preflight(ser, panel, delay, retries):
     """Verify the master confirms commands before doing any real work.
 
@@ -456,15 +472,19 @@ def main():
                         help="EEPROM slot (asked interactively when omitted)")
     parser.add_argument("--load", metavar="FILE",
                         help="Upload a 16x16 pattern file instead of prompting")
+    parser.add_argument("--fill", choices=("all", "center4"),
+                        help="Upload a built-in preset: every LED on, or the "
+                             "4 center LEDs on (handy for testing a panel)")
     parser.add_argument("--out", metavar="FILE",
                         help="Also write the interactively drawn pattern here")
     parser.add_argument("--identify", action="store_true",
                         help="Discover the panel's LED layout instead of editing a pattern")
     args = parser.parse_args()
 
-    if args.identify and args.load:
-        parser.error("--identify and --load are mutually exclusive")
-    if args.out and (args.load or args.identify):
+    modes = sum(1 for m in (args.load, args.fill, args.identify) if m)
+    if modes > 1:
+        parser.error("--load, --fill and --identify are mutually exclusive")
+    if args.out and (args.load or args.fill or args.identify):
         parser.error("--out only applies to an interactive session")
     if args.out:
         # Checked now, not after 256 prompts: --out exists to protect that work.
@@ -493,6 +513,8 @@ def main():
         except (OSError, ValueError) as e:
             print(f"ERROR: {e}")
             sys.exit(1)
+    elif args.fill:
+        bitmap = make_fill_bitmap(args.fill)
 
     slot = 0
     if not args.identify:
