@@ -436,8 +436,10 @@ venv/bin/python app.py /dev/ttyACM0      # then open http://localhost:8765
 venv/bin/python app.py --demo            # no hardware, synthetic readings
 ```
 Thresholds shown in the UI are read back from the slaves at startup (`t`), so
-the sliders reflect what the firmware is actually using rather than a hardcoded
-default. "Reload thr" re-reads them.
+the entry fields reflect what the firmware is actually using rather than a
+hardcoded default. Type a value (0–255) in a field and press Enter/blur to set
+that sensor; the "All" field or a preset button sets every sensor at once.
+"Reload thr" re-reads the fields.
 
 The server binds `127.0.0.1` by default. `/cmd` has no authentication and can
 zero and permanently save calibration to every slave's EEPROM, so `--host

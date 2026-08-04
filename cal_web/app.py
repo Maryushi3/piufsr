@@ -90,15 +90,9 @@ h1 { color: #ff6b6b; margin: 0; font-size: 22px; letter-spacing: 2px; }
 .v.warn { color: #ffb700; background: #2a2000; }
 .v.hit  { color: #ff3333; background: #2a0000; }
 
-.tv { font-size: 10px; color: #888; min-width: 20px; text-align: center; font-variant-numeric: tabular-nums; }
-
-/* horizontal sliders (up/down) */
-.sl-h { -webkit-appearance: none; appearance: none; height: 4px; width: 80px; background: #333; outline: none; border-radius: 2px; margin: 0; cursor: pointer; flex-shrink: 1; }
-.sl-h::-webkit-slider-thumb { -webkit-appearance: none; width: 10px; height: 16px; border-radius: 3px; background: #e94560; cursor: pointer; }
-.sl-h::-moz-range-thumb { width: 10px; height: 16px; border-radius: 3px; background: #e94560; cursor: pointer; border: none; }
-
-/* vertical sliders (left/right) — native macOS Aqua */
-.sl-v { -webkit-appearance: slider-vertical; width: 20px; height: 56px; margin: 0; cursor: pointer; }
+/* threshold entry fields */
+.thr { width: 48px; background: #0f0f1a; border: 1px solid #333; color: #eee; border-radius: 3px; font-size: 11px; text-align: center; font-variant-numeric: tabular-nums; padding: 2px 1px; }
+.thr:focus { border-color: #e94560; outline: none; }
 
 #bar { width: 100%; max-width: 600px; height: 4px; background: #1a1a2e; border-radius: 2px; overflow: hidden; }
 #bar-fill { height: 100%; width: 0%; background: #e94560; border-radius: 2px; transition: width 0.05s; }
@@ -109,9 +103,6 @@ h1 { color: #ff6b6b; margin: 0; font-size: 22px; letter-spacing: 2px; }
 #toolbar .danger { border-color: #5a0000; color: #ff6b6b; }
 #toolbar .danger:hover { background: #2a0000; }
 #global-row { display: flex; align-items: center; gap: 6px; margin: 0 6px; font-size: 11px; color: #888; }
-#global-row input { width: 100px; height: 4px; -webkit-appearance: none; appearance: none; background: #333; border-radius: 2px; outline: none; cursor: pointer; }
-#global-row input::-webkit-slider-thumb { -webkit-appearance: none; width: 10px; height: 16px; border-radius: 3px; background: #e94560; cursor: pointer; }
-#global-row input::-moz-range-thumb { width: 10px; height: 16px; border-radius: 3px; background: #e94560; cursor: pointer; border: none; }
 
 #status { color: #666; font-size: 11px; display: flex; align-items: center; gap: 6px; }
 #status .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; }
@@ -126,47 +117,47 @@ h1 { color: #ff6b6b; margin: 0; font-size: 22px; letter-spacing: 2px; }
 
 <!-- TL = div2, sensors 4-7: L=4 R=5 U=6 D=7 -->
 <div class="panel div2">
-  <div class="edge-up">  <span class="side">U</span><span class="v" id="v6">000</span><input type="range" class="sl-h" id="s6" min="0" max="255" value="125"><span class="tv" id="t6">125</span></div>
-  <div class="edge-l">  <span class="side">L</span><span class="v" id="v4">000</span><input type="range" class="sl-v" id="s4" min="0" max="255" value="125"><span class="tv" id="t4">125</span></div>
+  <div class="edge-up">  <span class="side">U</span><span class="v" id="v6">000</span><input type="number" class="thr" id="s6" min="0" max="255" step="1" value="125"></div>
+  <div class="edge-l">  <span class="side">L</span><span class="v" id="v4">000</span><input type="number" class="thr" id="s4" min="0" max="255" step="1" value="125"></div>
   <div class="mid"><span class="label">T.LFT P1</span></div>
-  <div class="edge-r">  <span class="side">R</span><span class="v" id="v5">000</span><input type="range" class="sl-v" id="s5" min="0" max="255" value="125"><span class="tv" id="t5">125</span></div>
-  <div class="edge-down"><span class="side">D</span><span class="v" id="v7">000</span><input type="range" class="sl-h" id="s7" min="0" max="255" value="125"><span class="tv" id="t7">125</span></div>
+  <div class="edge-r">  <span class="side">R</span><span class="v" id="v5">000</span><input type="number" class="thr" id="s5" min="0" max="255" step="1" value="125"></div>
+  <div class="edge-down"><span class="side">D</span><span class="v" id="v7">000</span><input type="number" class="thr" id="s7" min="0" max="255" step="1" value="125"></div>
 </div>
 
 <!-- TR = div4, sensors 12-15: L=12 R=13 U=14 D=15 -->
 <div class="panel div4">
-  <div class="edge-up">  <span class="side">U</span><span class="v" id="v14">000</span><input type="range" class="sl-h" id="s14" min="0" max="255" value="125"><span class="tv" id="t14">125</span></div>
-  <div class="edge-l">  <span class="side">L</span><span class="v" id="v12">000</span><input type="range" class="sl-v" id="s12" min="0" max="255" value="125"><span class="tv" id="t12">125</span></div>
+  <div class="edge-up">  <span class="side">U</span><span class="v" id="v14">000</span><input type="number" class="thr" id="s14" min="0" max="255" step="1" value="125"></div>
+  <div class="edge-l">  <span class="side">L</span><span class="v" id="v12">000</span><input type="number" class="thr" id="s12" min="0" max="255" step="1" value="125"></div>
   <div class="mid"><span class="label">T.RGT P3</span></div>
-  <div class="edge-r">  <span class="side">R</span><span class="v" id="v13">000</span><input type="range" class="sl-v" id="s13" min="0" max="255" value="125"><span class="tv" id="t13">125</span></div>
-  <div class="edge-down"><span class="side">D</span><span class="v" id="v15">000</span><input type="range" class="sl-h" id="s15" min="0" max="255" value="125"><span class="tv" id="t15">125</span></div>
+  <div class="edge-r">  <span class="side">R</span><span class="v" id="v13">000</span><input type="number" class="thr" id="s13" min="0" max="255" step="1" value="125"></div>
+  <div class="edge-down"><span class="side">D</span><span class="v" id="v15">000</span><input type="number" class="thr" id="s15" min="0" max="255" step="1" value="125"></div>
 </div>
 
 <!-- C = div3, sensors 8-11: L=8 R=9 U=10 D=11 -->
 <div class="panel div3">
-  <div class="edge-up">  <span class="side">U</span><span class="v" id="v10">000</span><input type="range" class="sl-h" id="s10" min="0" max="255" value="125"><span class="tv" id="t10">125</span></div>
-  <div class="edge-l">  <span class="side">L</span><span class="v" id="v8">000</span><input type="range" class="sl-v" id="s8" min="0" max="255" value="125"><span class="tv" id="t8">125</span></div>
+  <div class="edge-up">  <span class="side">U</span><span class="v" id="v10">000</span><input type="number" class="thr" id="s10" min="0" max="255" step="1" value="125"></div>
+  <div class="edge-l">  <span class="side">L</span><span class="v" id="v8">000</span><input type="number" class="thr" id="s8" min="0" max="255" step="1" value="125"></div>
   <div class="mid"><span class="label">CENTER P2</span></div>
-  <div class="edge-r">  <span class="side">R</span><span class="v" id="v9">000</span><input type="range" class="sl-v" id="s9" min="0" max="255" value="125"><span class="tv" id="t9">125</span></div>
-  <div class="edge-down"><span class="side">D</span><span class="v" id="v11">000</span><input type="range" class="sl-h" id="s11" min="0" max="255" value="125"><span class="tv" id="t11">125</span></div>
+  <div class="edge-r">  <span class="side">R</span><span class="v" id="v9">000</span><input type="number" class="thr" id="s9" min="0" max="255" step="1" value="125"></div>
+  <div class="edge-down"><span class="side">D</span><span class="v" id="v11">000</span><input type="number" class="thr" id="s11" min="0" max="255" step="1" value="125"></div>
 </div>
 
 <!-- BL = div1, sensors 0-3: L=0 R=1 U=2 D=3 -->
 <div class="panel div1">
-  <div class="edge-up">  <span class="side">U</span><span class="v" id="v2">000</span><input type="range" class="sl-h" id="s2" min="0" max="255" value="125"><span class="tv" id="t2">125</span></div>
-  <div class="edge-l">  <span class="side">L</span><span class="v" id="v0">000</span><input type="range" class="sl-v" id="s0" min="0" max="255" value="125"><span class="tv" id="t0">125</span></div>
+  <div class="edge-up">  <span class="side">U</span><span class="v" id="v2">000</span><input type="number" class="thr" id="s2" min="0" max="255" step="1" value="125"></div>
+  <div class="edge-l">  <span class="side">L</span><span class="v" id="v0">000</span><input type="number" class="thr" id="s0" min="0" max="255" step="1" value="125"></div>
   <div class="mid"><span class="label">B.LFT P0</span></div>
-  <div class="edge-r">  <span class="side">R</span><span class="v" id="v1">000</span><input type="range" class="sl-v" id="s1" min="0" max="255" value="125"><span class="tv" id="t1">125</span></div>
-  <div class="edge-down"><span class="side">D</span><span class="v" id="v3">000</span><input type="range" class="sl-h" id="s3" min="0" max="255" value="125"><span class="tv" id="t3">125</span></div>
+  <div class="edge-r">  <span class="side">R</span><span class="v" id="v1">000</span><input type="number" class="thr" id="s1" min="0" max="255" step="1" value="125"></div>
+  <div class="edge-down"><span class="side">D</span><span class="v" id="v3">000</span><input type="number" class="thr" id="s3" min="0" max="255" step="1" value="125"></div>
 </div>
 
 <!-- BR = div5, sensors 16-19: L=16 R=17 U=18 D=19 -->
 <div class="panel div5">
-  <div class="edge-up">  <span class="side">U</span><span class="v" id="v18">000</span><input type="range" class="sl-h" id="s18" min="0" max="255" value="125"><span class="tv" id="t18">125</span></div>
-  <div class="edge-l">  <span class="side">L</span><span class="v" id="v16">000</span><input type="range" class="sl-v" id="s16" min="0" max="255" value="125"><span class="tv" id="t16">125</span></div>
+  <div class="edge-up">  <span class="side">U</span><span class="v" id="v18">000</span><input type="number" class="thr" id="s18" min="0" max="255" step="1" value="125"></div>
+  <div class="edge-l">  <span class="side">L</span><span class="v" id="v16">000</span><input type="number" class="thr" id="s16" min="0" max="255" step="1" value="125"></div>
   <div class="mid"><span class="label">B.RGT P4</span></div>
-  <div class="edge-r">  <span class="side">R</span><span class="v" id="v17">000</span><input type="range" class="sl-v" id="s17" min="0" max="255" value="125"><span class="tv" id="t17">125</span></div>
-  <div class="edge-down"><span class="side">D</span><span class="v" id="v19">000</span><input type="range" class="sl-h" id="s19" min="0" max="255" value="125"><span class="tv" id="t19">125</span></div>
+  <div class="edge-r">  <span class="side">R</span><span class="v" id="v17">000</span><input type="number" class="thr" id="s17" min="0" max="255" step="1" value="125"></div>
+  <div class="edge-down"><span class="side">D</span><span class="v" id="v19">000</span><input type="number" class="thr" id="s19" min="0" max="255" step="1" value="125"></div>
 </div>
 
 </div>
@@ -180,7 +171,7 @@ h1 { color: #ff6b6b; margin: 0; font-size: 22px; letter-spacing: 2px; }
   <button onclick="allThr(75)">75</button>
   <button onclick="allThr(100)">100</button>
   <button onclick="allThr(150)">150</button>
-  <span id="global-row">All <input type="range" id="global-sl" min="0" max="255" value="125"><span id="global-val" style="color:#eee;min-width:24px;text-align:center;font-size:12px">125</span></span>
+  <span id="global-row">All <input type="number" class="thr" id="global-in" min="0" max="255" step="1" value="125"></span>
   <button class="danger" onclick="doCmd('zero')">Zero</button>
   <button class="danger" onclick="doCmd('save')">Save</button>
   <button onclick="doCmd('refresh')">Reload thr</button>
@@ -195,8 +186,7 @@ var thrSeq = -1;
 var barFill = document.getElementById('bar-fill');
 var dot = document.getElementById('dot');
 var st = document.getElementById('st');
-var globalSl = document.getElementById('global-sl');
-var globalVal = document.getElementById('global-val');
+var globalIn = document.getElementById('global-in');
 
 function p3(n) { return n < 100 ? (n < 10 ? '  ' + n : ' ' + n) : '' + n; }
 
@@ -207,42 +197,53 @@ function post(body) {
 
 function showThr(idx, v) {
   thrs[idx] = v;
-  document.getElementById('t' + idx).textContent = p3(v);
-  document.getElementById('s' + idx).value = v;
+  var el = document.getElementById('s' + idx);
+  if (el !== document.activeElement) el.value = v;
 }
 
 // Thresholds come from the firmware, not from the markup, so the UI can never
-// claim a value the slaves are not using.
+// claim a value the slaves are not using. Fields being actively edited are
+// left alone so an SSE echo does not yank the value while typing.
 function applyThresholds(t) {
   for (var i = 0; i < N; i++) showThr(i, t[i]);
   var allSame = t.every(function(x) { return x === t[0]; });
-  if (allSame) { globalSl.value = t[0]; globalVal.textContent = t[0]; }
+  if (allSame && globalIn !== document.activeElement) globalIn.value = t[0];
+}
+
+function commitThr(idx, el) {
+  var v = parseInt(el.value, 10);
+  if (isNaN(v)) { el.value = thrs[idx]; return; }
+  v = Math.max(0, Math.min(255, v));
+  el.value = v;
+  if (v === thrs[idx]) return;
+  thrs[idx] = v;
+  post({idx:idx, val:v});
 }
 
 for (var i = 0; i < N; i++) {
   (function(idx) {
-    var sl = document.getElementById('s' + idx);
-    sl.addEventListener('input', function() {
-      thrs[idx] = parseInt(this.value);
-      document.getElementById('t' + idx).textContent = p3(this.value);
-    });
-    sl.addEventListener('change', function() {
-      post({idx:idx, val:thrs[idx]});
+    var el = document.getElementById('s' + idx);
+    el.addEventListener('change', function() { commitThr(idx, this); });
+    el.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') this.blur();
     });
   })(i);
 }
 
-globalSl.addEventListener('input', function() {
-  var v = parseInt(this.value);
-  globalVal.textContent = v;
-  for (var i = 0; i < N; i++) showThr(i, v);
-});
-globalSl.addEventListener('change', function() {
-  post({all:parseInt(this.value)});
+function commitAll(el) {
+  var v = parseInt(el.value, 10);
+  if (isNaN(v)) { el.value = thrs[0]; return; }
+  allThr(v);
+}
+
+globalIn.addEventListener('change', function() { commitAll(this); });
+globalIn.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') this.blur();
 });
 
 function allThr(v) {
-  globalSl.value = v; globalVal.textContent = v;
+  v = Math.max(0, Math.min(255, Math.round(v)));
+  globalIn.value = v;
   for (var i = 0; i < N; i++) showThr(i, v);
   post({all:v});
 }
@@ -286,7 +287,7 @@ state = {
     "values": [0] * NUM_SENSORS,
     "thresholds": [FIRMWARE_DEFAULT_THRESHOLD] * NUM_SENSORS,
     # Bumped whenever thresholds change server-side, so a browser knows to
-    # re-sync its sliders without being told twenty times a second.
+    # re-sync its threshold fields without being told twenty times a second.
     "seq": 0,
     "link": False,
 }
