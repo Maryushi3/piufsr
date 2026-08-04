@@ -161,14 +161,17 @@ clock-stretch a poll by ~8 ms. The 12 ms timeout absorbs this; worst case is
 
 ### Poll Loop
 ```
-pollAllPanels()         →  5-byte read per slave
-handleLEDTransitions()  →  send 0x01/0x00 on state change
+pollAllPanels()         →  5-byte read per slave (reads only)
 updateGamepad()         →  Gamepad.press/release on state change
 Gamepad.write()         →  USB HID report, only when state changed
 processSerial()         →  handle at most ONE command from the PC
 ```
 
 Polling runs at ~1.4 kHz (5-byte reads each panel).
+
+During gameplay the master sends nothing on the I2C bus: the slaves toggle
+their own LEDs from their FSR state, so the whole read→gamepad path is
+read-only. The only writes happen for calibration or LED-editing commands.
 
 `processSerial()` deliberately handles **one line per iteration**. A single
 command can cost several I2C transactions, so draining a whole burst (a
@@ -188,7 +191,10 @@ open but is not draining it makes `Serial` writes block, and ~700 bytes of
 banner could otherwise outlast the 2 s timeout before `loop()` first runs.
 
 ### Gamepad
-5 buttons (one per panel). Button is pressed when `(buf[0] & 0x0F) != 0` (any FSR above threshold).
+5 buttons (one per panel). Button is pressed when `(buf[0] & 0x0F) != 0` (any
+FSR above its press threshold). Because the slave's LED follows the same
+`fsrActive` bit, the pad's lights and the virtual buttons move 1:1 — release
+is not delayed by the master (it is purely the slave's Schmitt + poll).
 
 **HID reports are only written when the button state changes.** Hosts only
 poll a gamepad's USB interrupt endpoint while some program holds the device
@@ -208,9 +214,9 @@ second instead of one per crossing; with a game attached, writes take
 microseconds and the backoff never engages.
 
 A panel going offline forces its button released, so a dead slave cannot leave
-a button stuck down. The matching LED-off write is skipped while the panel is
-offline and re-attempted once it answers again, so a wedged slave doesn't cost
-a 12 ms timeout on every loop iteration.
+a button stuck down. (The LED is driven by the slave itself, so there is no
+LED write to retry; a wedged slave just keeps its last display until it
+recovers.)
 
 ### Calibration Streaming
 When enabled (`c` command), sends at 20 Hz:
@@ -233,10 +239,11 @@ specific hardware conditions (all absorbed without data loss):
 What makes it vary: a slave's `FastLED.show()` blacks out its interrupts for
 ~8 ms, so a poll that lands on a press/release LED update is clock-stretched
 (the 12 ms timeout absorbs it); heavy bus capacitance slows edges; serial
-prints can block briefly if the host stops draining the port. Press→event
-latency is ~2-5 ms typically; release adds the intentional 40 ms
-`RELEASE_HOLD_MS` (anti-flap). The game itself samples at its own frame rate
-on top of all of this.
+prints can block briefly if the host stops draining the port. Press and
+release both clear as soon as the FSR value crosses its threshold — there is
+no hold delay — so LED and gamepad follow the foot in ~1-2 ms typically (LED
+instantly, the button one poll later). The game itself samples at its own
+frame rate on top of all of this.
 
 **Do not trust browser gamepad testers for rate numbers.** They sample the
 Web Gamepad API at `requestAnimationFrame` cadence (display Hz) and coalesce
@@ -259,10 +266,13 @@ rate. Measure instead:
 |-------|--------|
 | `o` | Zero offsets (command `0x05` to all slaves) |
 | `v` | Print cached compensated values |
-| `t` | Print thresholds — always 20 values, `0` for an unreachable panel |
+| `t` | Print press thresholds — always 20 values, `0` for an unreachable panel |
+| `q` | Print release thresholds — always 20 values, `0` for an unreachable panel |
 | `s` | Save calibration to EEPROM (command `0x07` to all slaves) |
-| `s <idx> <val>` | Set threshold for sensor `idx` (0-19) to `val` (0-255) |
-| `a <val>` | Set every threshold to `val` — one write per panel (`0x0C`) |
+| `s <idx> <val>` | Set press threshold for sensor `idx` (0-19) to `val` (0-255) |
+| `a <val>` | Set every press threshold to `val` — one write per panel (`0x0C`) |
+| `e <idx> <val>` | Set release threshold for sensor `idx` (0-19) to `val` (0-255) |
+| `y <val>` | Set every release threshold to `val` — one write per panel (`0x10`) |
 | `c` | Toggle streaming mode |
 | `u <panel> <slot> <64 hex chars>` | Upload 32-byte bitmap to `panel` (0-4) `slot` (0-3) |
 | `x <panel> <x> <y> <0/1>` | Set pixel at (x,y) on/off — `panel` (0-4), `x`/`y` (0-15) |
@@ -272,6 +282,7 @@ rate. Measure instead:
 | `b <panel> <val>` | Set panel brightness 0-255 (`0x02`) |
 | `i <panel>` | Trigger identify blink on panel (blinks 1-5 on D13 LED) |
 | `i` | Scan the bus: report which panel addresses ACK |
+| `l` | Live LED mode on all panels: FSR-driven (after a manual/editing preview) |
 | `r` | Print loop-rate stats since the last `r` (or boot), then reset the window |
 | `h` / `?` | Help |
 
@@ -303,12 +314,16 @@ separate core library, so a macro defined in the sketch never reaches them —
 the slave RX buffer stays 32 bytes regardless. Every command is therefore
 <= 32 bytes and pattern uploads are chunked (`0x03`).
 
-### I2C Response (9 bytes)
+### I2C Response (13 bytes)
 ```
-[0]  fsrActive       bitmask: bit 0=Left,1=Right,2=Up,3=Down
+[0]     fsrActive        bitmask: bit 0=Left,1=Right,2=Up,3=Down
 [1..4]  compensated[0..3]  compensated FSR values (raw - offset)
-[5..8]  thresholds[0..3]   current threshold values
+[5..8]  thresholds[0..3]   press threshold values
+[9..12] releaseThrs[0..3]  release threshold values
 ```
+
+The master's gameplay poll reads only the first 5 bytes (status + compensated);
+`t`/`q` read all 13.
 
 ### I2C Commands Received
 
@@ -326,15 +341,19 @@ the slave RX buffer stays 32 bytes regardless. Every command is therefore
 | `0x09` | x, y, on | Set pixel (updates leds[] and patternBuffer) |
 | `0x0A` | slot | Save current patternBuffer to EEPROM slot |
 | `0x0B` | — | Identify: blink LED on D13 (1-5 times) |
-| `0x0C` | value | Set all four thresholds to `value` |
+| `0x0C` | value | Set all four press thresholds to `value` |
 | `0x0D` | — | Clear the live pattern |
+| `0x0E` | — | Enter FSR-driven LED mode (LED follows the FSR state) |
+| `0x0F` | idx, value | Set release threshold[idx] |
+| `0x10` | value | Set all four release thresholds to `value` |
 
 Argument bytes are consumed before validation, so an out-of-range argument
 can never leave payload bytes in the buffer to be misread as the next
 command. An unrecognised command byte discards the rest of the frame for the
-same reason. Thresholds are clamped to a minimum of 1: at 0 the Schmitt
+same reason. Press thresholds are clamped to a minimum of 1: at 0 the Schmitt
 trigger's release point would also be 0, so the FSR would read as permanently
-pressed.
+pressed. Release thresholds are clamped at use so they always stay below the
+press threshold (keeping a hysteresis gap).
 
 ### Deferred operations
 Anything slow (EEPROM writes, `analogRead`, `FastLED` calls) is deferred out
@@ -355,17 +374,32 @@ landing mid-write would otherwise produce a half-old/half-new saved pattern.
 ```
 raw = analogRead(pin) >> 2
 compensated = (raw >= offset) ? (raw - offset) : 0
-Schmitt trigger: bit set when compensated >= threshold,
-                 cleared when compensated < threshold * 3/4
+Schmitt trigger: bit set when compensated >= press threshold,
+                 cleared when compensated < release threshold
 ```
-Once any FSR goes active, `fsrActive` is held for `RELEASE_HOLD_MS` (40 ms)
-after the last hit, so values wobbling near the threshold during a hold don't
-flap the panel state (LED flicker / gamepad press-release jitter). Presses
-stay instant — only the release is held off.
+The release threshold is a separate, per-FSR calibration value, independent of
+the press threshold, and is clamped at use to stay at least 1 below the press
+threshold (a value >= the press threshold would collapse the hysteresis gap).
+Because it is anchored near the offset floor rather than scaled off the press
+threshold, the bit clears as soon as the FSR mechanically relaxes — there is no
+fixed release hold delay. Debounce of any residual threshold wobble is left to
+the game.
 
 ### LED Rendering
-- Event-driven: `FastLED.show()` runs only when the visuals change (panel on/off, pattern/pixel upload, slot select, brightness). WS2812B latches its data, so no periodic refresh is needed.
-- This matters for I2C reliability: a 256-LED `show()` blocks interrupts for ~8 ms on the ATmega328P, so a fixed-rate refresh would keep the slave from answering the master ~half of the time.
+- FSR-driven during gameplay: while no panel command has pinned the display,
+  `panelOn` follows `fsrActive` 1:1 (the same bit the master forwards as the
+  gamepad button), so the pad's lights and the virtual button move together.
+  The master's game loop is read-only on the I2C bus — no LED on/off writes.
+- Pattern-editing commands (`0x01`, `0x09`, `0x0D`, `0x04`, and an upload into
+  the active slot) pin the display (`ledManualHold`), so the editor's preview
+  survives. The first foot press clears the hold, handing the LED back to
+  gameplay; `0x0E` does the same explicitly.
+- Event-driven: `FastLED.show()` runs only when the visuals change (panel
+  on/off, pattern/pixel upload, slot select, brightness). WS2812B latches its
+  data, so no periodic refresh is needed.
+- This matters for I2C reliability: a 256-LED `show()` blocks interrupts for
+  ~8 ms on the ATmega328P, so a fixed-rate refresh would keep the slave from
+  answering the master ~half of the time.
 - If `panelOn == true`: calls `ledsFromBitmap()`, then `FastLED.show()`
 - If `panelOn == false`: calls `FastLED.clear()`, then `FastLED.show()`
 
@@ -387,13 +421,21 @@ state machine doesn't stop `loop()`, which keeps calling `wdt_reset()`.
 | Range | Content |
 |-------|---------|
 | `0..3` | Offsets[0..3] |
-| `4..7` | Thresholds[0..3] |
+| `4..7` | Press thresholds[0..3] |
 | `8..39` | Pattern slot 0 (32 bytes bitmap) |
 | `40..71` | Pattern slot 1 |
 | `72..103` | Pattern slot 2 |
 | `104..135` | Pattern slot 3 |
 | `136` | Active slot index |
 | `137` | Calibration magic (`0xA5`) |
+| `138..141` | Release thresholds[0..3] |
+| `142` | Release-threshold magic (`0xA5`) |
+
+The pattern slots (8..135) are a hard layout commitment — they must never move.
+Release thresholds were added in the previously-unused bytes 138..142, so a
+slave that already has patterns/calibration stored keeps them: on first boot
+with new firmware the release thresholds are written with their defaults and a
+magic byte, leaving everything else untouched.
 
 The magic byte marks "calibration has been written". Freshness used to be
 inferred from `offsets[0] == 0xFF`, which would factory-reset a pad whose first
@@ -419,12 +461,21 @@ cost no wear and no 3.3 ms erase cycle.
 ### 3. First-time calibration
 ```
 o          →  zero offsets (with feet off the pad)
-t          →  verify thresholds (20 values; 0 means that panel is unreachable)
-s <i> <v>  →  adjust an individual FSR threshold
-a <v>      →  set every threshold at once
+t          →  verify press thresholds (20 values; 0 means that panel is unreachable)
+q          →  verify release thresholds (20 values; 0 means that panel is unreachable)
+s <i> <v>  →  adjust an individual FSR press threshold
+a <v>      →  set every press threshold at once
+e <i> <v>  →  adjust an individual FSR release threshold
+y <v>      →  set every release threshold at once
 s          →  save to EEPROM
 c          →  toggle streaming (for a visualizer)
 ```
+
+The release threshold is the lower edge of the Schmitt trigger: an FSR is
+"released" once its compensated value drops below it, regardless of the press
+threshold. Keep it just above the pad's idle noise (default 20); too high
+holds a button/lights on after a light step, too low lets residual pressure
+keep it pressed.
 
 On power-up each slave blinks its panel ID on D13 (1 blink = panel 0, 5 blinks = panel 4) so you can verify the address mapping. Use `i <p>` at any time to re-identify a panel.
 
@@ -435,11 +486,13 @@ cd cal_web
 venv/bin/python app.py /dev/ttyACM0      # then open http://localhost:8765
 venv/bin/python app.py --demo            # no hardware, synthetic readings
 ```
-Thresholds shown in the UI are read back from the slaves at startup (`t`), so
-the entry fields reflect what the firmware is actually using rather than a
-hardcoded default. Type a value (0–255) in a field and press Enter/blur to set
-that sensor; the "All" field or a preset button sets every sensor at once.
-"Reload thr" re-reads the fields.
+Press and release thresholds shown in the UI are read back from the slaves at
+startup (`t` and `q`), so the entry fields reflect what the firmware is
+actually using rather than a hardcoded default. Each sensor has a press field
+(left, red-bordered on focus) and a smaller release field (teal). Type a value
+(0–255) in a field and press Enter/blur to set that sensor; the "All" /
+"Release" fields or preset buttons set every sensor at once. "Reload"
+re-reads both from the slaves.
 
 The server binds `127.0.0.1` by default. `/cmd` has no authentication and can
 zero and permanently save calibration to every slave's EEPROM, so `--host
@@ -447,6 +500,10 @@ zero and permanently save calibration to every slave's EEPROM, so `--host
 network you trust.
 
 ### 4. LED pattern upload
+
+Pattern-editing commands pin the panel's display so the preview stays visible
+while you work. Once you step on the pad the LED goes back to following the
+FSR state 1:1; `l` (live mode) does the same explicitly.
 
 #### Manual hex upload
 ```

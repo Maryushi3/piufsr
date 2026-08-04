@@ -33,19 +33,28 @@
 #define NUM_SLOTS       4
 #define BITMAP_BYTES    32
 #define UPLOAD_CHUNK    8
-#define RELEASE_HOLD_MS 40
 
+// EEPROM layout is fixed: pattern slots live at 8..135 and must never move.
+// Release thresholds are new — they go in the previously-unused bytes after
+// the calibration magic, so existing patterns/calibration are left untouched.
 #define EEP_OFF(n)      (n)
 #define EEP_THR(n)      ((n) + 4)
 #define EEP_PAT(slot)   (8 + (slot) * BITMAP_BYTES)
 #define EEP_ACTIVE_SLOT (8 + NUM_SLOTS * BITMAP_BYTES)
 #define EEP_CAL_MAGIC   (EEP_ACTIVE_SLOT + 1)
+#define EEP_REL(n)      (138 + (n))
+#define EEP_REL_MAGIC   (142)
 
 static const uint8_t kFsrPins[NUM_FSRS] = {A0, A1, A2, A3};
 static const uint8_t kCalMagic = 0xA5;
 static const uint8_t kDefaultThreshold = 125;
-// A threshold of 0 would make the Schmitt trigger's release point 0 too, so
-// the FSR would read as permanently pressed. 1 is the lowest usable value.
+// The Schmitt trigger clears an FSR bit below this value, independently of the
+// press threshold. Anchoring it near the offset floor (rather than scaling
+// with the press threshold) makes release track the FSR's real mechanical
+// relaxation, so lights and the gamepad go off as soon as the foot leaves.
+static const uint8_t kDefaultReleaseThreshold = 20;
+// A press threshold of 0 would set the bit whenever compensated > 0, leaving
+// no room for a release edge. 1 is the lowest usable value.
 static const uint8_t kMinThreshold = 1;
 static const uint16_t kIdentityOnMs = 120;
 static const uint16_t kIdentityGapMs = 200;
@@ -60,16 +69,20 @@ static uint8_t i2cAddress = I2C_ADDR;
 static volatile uint8_t compensated[NUM_FSRS];
 static volatile uint8_t offsets[NUM_FSRS];
 static volatile uint8_t thresholds[NUM_FSRS];
+static volatile uint8_t releaseThrs[NUM_FSRS];
 static volatile uint8_t fsrActive;
 
 static CRGB leds[NUM_LEDS];
 static volatile bool panelOn;
 static volatile bool showPending;
+// While set, the LED display is pinned by the master (pattern editing) and
+// ignores the FSR state. Any foot press clears it, handing control back to
+// gameplay; the master can also clear it explicitly via command 0x0E.
+static volatile bool ledManualHold;
 static volatile bool identifyPending;
 // Written from the I2C receive ISR (set-pixel / upload into the active slot),
 // read by loop() — must be volatile.
 static volatile uint8_t patternBuffer[BITMAP_BYTES];
-static unsigned long lastActiveMs;
 
 static uint8_t lastActiveSlot;
 
@@ -122,12 +135,26 @@ static uint8_t clampThreshold(uint8_t v) {
   return (v < kMinThreshold) ? kMinThreshold : v;
 }
 
+// The release edge of the Schmitt trigger. Stored independently of the press
+// threshold, but clamped to keep a hysteresis gap (and to never go below 1,
+// otherwise the bit would never clear).
+static uint8_t effectiveRelease(int i) {
+  uint8_t thr = thresholds[i];
+  uint8_t rel = releaseThrs[i];
+  if (thr <= 1) return 1;
+  if (rel >= thr) rel = thr - 1;
+  if (rel < 1) rel = 1;
+  return rel;
+}
+
 static void saveCalibration() {
   for (int i = 0; i < NUM_FSRS; i++) {
     EEPROM.update(EEP_OFF(i), offsets[i]);
     EEPROM.update(EEP_THR(i), thresholds[i]);
+    EEPROM.update(EEP_REL(i), releaseThrs[i]);
   }
   EEPROM.update(EEP_CAL_MAGIC, kCalMagic);
+  EEPROM.update(EEP_REL_MAGIC, kCalMagic);
 }
 
 static void loadCalibration() {
@@ -137,12 +164,23 @@ static void loadCalibration() {
     for (int i = 0; i < NUM_FSRS; i++) {
       offsets[i] = 0;
       thresholds[i] = kDefaultThreshold;
+      releaseThrs[i] = kDefaultReleaseThreshold;
     }
     saveCalibration();
   } else {
     for (int i = 0; i < NUM_FSRS; i++) {
       offsets[i] = EEPROM.read(EEP_OFF(i));
       thresholds[i] = clampThreshold(EEPROM.read(EEP_THR(i)));
+    }
+    // Release thresholds postdate the calibration magic: a slave flashed with
+    // older firmware has blank (0xFF) bytes here and no REL magic. Give those
+    // the default without disturbing the stored patterns or offsets. Writes
+    // use EEPROM.update, so unchanged bytes cost nothing.
+    if (EEPROM.read(EEP_REL_MAGIC) != kCalMagic) {
+      for (int i = 0; i < NUM_FSRS; i++) releaseThrs[i] = kDefaultReleaseThreshold;
+      saveCalibration();
+    } else {
+      for (int i = 0; i < NUM_FSRS; i++) releaseThrs[i] = EEPROM.read(EEP_REL(i));
     }
   }
 }
@@ -231,11 +269,12 @@ static void ledsFromBitmap() {
 /*===========================================================================*/
 
 static void requestHandler() {
-  uint8_t out[9];
+  uint8_t out[13];
   out[0] = fsrActive;
   for (int i = 0; i < NUM_FSRS; i++) out[1 + i] = compensated[i];
   for (int i = 0; i < NUM_FSRS; i++) out[5 + i] = thresholds[i];
-  Wire.write(out, 9);
+  for (int i = 0; i < NUM_FSRS; i++) out[9 + i] = releaseThrs[i];
+  Wire.write(out, 13);
   i2cActivity = true;
 }
 
@@ -246,10 +285,12 @@ static void receiveHandler(int numBytes) {
     uint8_t cmd = Wire.read();
     switch (cmd) {
       case 0x00:
+        ledManualHold = true;
         panelOn = false;
         showPending = true;
         break;
       case 0x01:
+        ledManualHold = true;
         panelOn = true;
         showPending = true;
         break;
@@ -324,6 +365,7 @@ static void receiveHandler(int numBytes) {
               patternBuffer[idx >> 3] &= ~(1 << (idx & 7));
             }
             panelOn = true;
+            ledManualHold = true;
             showPending = true;
           }
         }
@@ -348,8 +390,26 @@ static void receiveHandler(int numBytes) {
         break;
       case 0x0D:
         clearPattern();
+        ledManualHold = true;
         panelOn = true;
         showPending = true;
+        break;
+      case 0x0E:
+        // Re-enter FSR-driven LED mode after a pattern-editing session.
+        ledManualHold = false;
+        break;
+      case 0x0F:
+        if (Wire.available() >= 2) {
+          uint8_t idx = Wire.read();
+          uint8_t val = Wire.read();  // consumed even when idx is invalid
+          if (idx < NUM_FSRS) releaseThrs[idx] = val;
+        }
+        break;
+      case 0x10:
+        if (Wire.available() > 0) {
+          uint8_t val = Wire.read();
+          for (int i = 0; i < NUM_FSRS; i++) releaseThrs[i] = val;
+        }
         break;
       default:
         // Unknown command: the rest of the frame cannot be interpreted
@@ -397,6 +457,7 @@ void setup() {
   loadCalibration();
   initPatterns();
   panelOn = false;
+  ledManualHold = false;
 
   pinMode(ID_LED_PIN, OUTPUT);
   startIdentity();
@@ -406,35 +467,41 @@ void setup() {
   wdt_enable(WDTO_4S);
 }
 
-static void readFsrs(unsigned long now) {
+static void readFsrs() {
   for (int i = 0; i < NUM_FSRS; i++) {
     uint8_t raw = analogRead(kFsrPins[i]) >> 2;
     uint8_t off = offsets[i];
     compensated[i] = (raw >= off) ? (raw - off) : 0;
   }
 
-  // Schmitt trigger per FSR: set at >= threshold, clear below 3/4 of it,
-  // so a value wobbling right at the threshold doesn't flap the bit.
+  // Schmitt trigger per FSR: set at >= press threshold, clear below the
+  // release threshold. Anchoring the release edge near the offset floor (not
+  // scaled off the press threshold) makes release track the FSR's actual
+  // mechanical relaxation — no fixed hold delay is needed, so the state
+  // clears as soon as the foot leaves.
   uint8_t active = fsrActive;
   for (int i = 0; i < NUM_FSRS; i++) {
     uint8_t thr = thresholds[i];
+    uint8_t rel = effectiveRelease(i);
     if (compensated[i] >= thr) {
       active |= 1 << i;
-    } else if (compensated[i] < thr - (thr >> 2)) {
+    } else if (compensated[i] < rel) {
       active &= ~(1 << i);
     }
   }
+  fsrActive = active;
 
-  // Keep reporting the panel as active for a short time after the last hit.
-  // Without this, FSR values hovering near the threshold during a hold make
-  // the panel state flap, which the master forwards as LED on/off spam
-  // (visible flicker) and gamepad press/release jitter. Presses stay
-  // instant — only the release is held off.
-  if (active != 0) {
-    fsrActive = active;
-    lastActiveMs = now;
-  } else if ((unsigned long)(now - lastActiveMs) >= RELEASE_HOLD_MS) {
-    fsrActive = 0;
+  // LED auto-toggle: while no panel command has pinned the display, the LED
+  // follows the FSR state 1:1 (same bit the master forwards as the gamepad
+  // button). The first foot press after a pattern-editing session clears
+  // ledManualHold, handing the display back to gameplay.
+  if (active != 0) ledManualHold = false;
+  if (!ledManualHold) {
+    bool want = (fsrActive != 0);
+    if (want != panelOn) {
+      panelOn = want;
+      showPending = true;
+    }
   }
 }
 
@@ -455,6 +522,7 @@ static void processPendingOps() {
     savePatternBytes(uSlot, snap);
     if (uSlot == lastActiveSlot) {
       restoreBitmap(snap, patternBuffer);
+      ledManualHold = true;
       showPending = true;
     }
   }
@@ -483,6 +551,7 @@ static void processPendingOps() {
     lastActiveSlot = nSlot;
     EEPROM.update(EEP_ACTIVE_SLOT, nSlot);
     loadPattern(nSlot);
+    ledManualHold = true;
     showPending = true;
   }
   if (ops & OP_LOAD_CAL) {
@@ -532,12 +601,11 @@ static void serviceI2cStall(unsigned long now) {
 
 void loop() {
   wdt_reset();
-  unsigned long now = millis();
 
-  readFsrs(now);
+  readFsrs();
   processPendingOps();
   serviceIdentityRequest();
   serviceIdentity();
   renderIfDirty();
-  serviceI2cStall(now);
+  serviceI2cStall(millis());
 }

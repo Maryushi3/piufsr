@@ -20,7 +20,6 @@ static const uint8_t kMaxPanelFails = 5;
 static const uint16_t kBusRecoverIntervalMs = 1000;
 
 static bool panelActive[NUM_PANELS];
-static bool prevPanelActive[NUM_PANELS];
 static uint8_t calValues[NUM_SENSORS];
 static uint8_t panelFailCount[NUM_PANELS];
 static unsigned long lastBusRecoverMs;
@@ -57,7 +56,6 @@ static bool twiWrite(uint8_t addr, uint8_t* data, uint8_t len);
 static bool twiProbe(uint8_t addr);
 
 static void updateGamepad();
-static void handleLEDTransitions();
 static void pollAllPanels();
 
 static int8_t hexNibble(char c);
@@ -72,9 +70,13 @@ static void handleRateStats();
 static void handleZeroOffsets();
 static void printValues();
 static void printThresholds();
+static void printReleaseThresholds();
 static void handleSaveCal();
 static void handleSetThreshold(char* args);
 static void handleSetAllThresholds(char* args);
+static void handleSetReleaseThreshold(char* args);
+static void handleSetAllReleaseThresholds(char* args);
+static void handleLiveMode();
 static void handleScan();
 static void handleIdentify(char* args);
 static void handleUploadPattern(char* args);
@@ -266,22 +268,6 @@ static void updateGamepad() {
   }
 }
 
-static void handleLEDTransitions() {
-  for (int p = 0; p < NUM_PANELS; p++) {
-    if (panelActive[p] == prevPanelActive[p]) continue;
-    // Skip panels already declared offline. Going offline forces panelActive
-    // false (so the gamepad button can't stick), which creates a pending
-    // LED-off write; retrying it every loop would cost a 12 ms timeout per
-    // iteration against a wedged slave. Leaving prevPanelActive alone means
-    // the transition is simply re-attempted once the panel answers again.
-    if (panelFailCount[p] >= kMaxPanelFails) continue;
-    uint8_t cmd = panelActive[p] ? 0x01 : 0x00;
-    if (twiWrite(kPanelAddresses[p], &cmd, 1)) {
-      prevPanelActive[p] = panelActive[p];
-    }
-  }
-}
-
 static void pollAllPanels() {
   for (int p = 0; p < NUM_PANELS; p++) {
     // Never stop polling a panel: a genuinely absent slave fails fast (NACK),
@@ -337,7 +323,7 @@ void setup() {
   Serial.begin(kSerialBaud);
   twiInit();
   for (int p = 0; p < NUM_PANELS; p++) {
-    panelActive[p] = prevPanelActive[p] = gamepadReported[p] = false;
+    panelActive[p] = gamepadReported[p] = false;
     panelFailCount[p] = 0;
   }
   Gamepad.begin();
@@ -364,8 +350,9 @@ void loop() {
   unsigned long now = micros();
   wdt_reset();
 
+  // Reads only: the slaves toggle their own LEDs from their FSR state, so
+  // gameplay needs no writes to the panels at all.
   pollAllPanels();
-  handleLEDTransitions();
 
   if (now - lastSendUs + lastIterationUs >= (unsigned long)kSendIntervalUs) {
     updateGamepad();
@@ -442,6 +429,10 @@ static void printHelp() {
   Serial.println(F("  s          Save calibration to EEPROM"));
   Serial.println(F("  s <i> <v>  Set threshold sensor i (0-19) to v (0-255)"));
   Serial.println(F("  a <v>      Set every threshold to v (one write per panel)"));
+  Serial.println(F("  e <i> <v>  Set release threshold sensor i (0-19) to v (0-255)"));
+  Serial.println(F("  y <v>      Set every release threshold to v (one write per panel)"));
+  Serial.println(F("  q          Print release thresholds (20 values, 0 = offline)"));
+  Serial.println(F("  l          Live LED mode on all panels (FSR-driven, after editing)"));
   Serial.println(F("  c          Toggle streaming 20Hz"));
   Serial.println(F("  u <p> <s> <64hex>  Upload 32B pattern to panel p slot s"));
   Serial.println(F("  x <p> <x> <y> <0/1>  Set pixel on panel p"));
@@ -505,6 +496,10 @@ static void dispatchCommand(char* buf) {
       }
       break;
     case 'a': case 'A': handleSetAllThresholds(args); break;
+    case 'e': case 'E': handleSetReleaseThreshold(args); break;
+    case 'y': case 'Y': handleSetAllReleaseThresholds(args); break;
+    case 'q': case 'Q': printReleaseThresholds(); break;
+    case 'l': case 'L': handleLiveMode(); break;
     case 'c': case 'C':
       calibrating = !calibrating;
       calPrintUs = micros();
@@ -582,15 +577,30 @@ static void printValues() {
 }
 
 // Always emits exactly NUM_SENSORS values so clients can index into the reply
-// positionally; an unreachable panel contributes four zeros.
+// positionally; an unreachable panel contributes four zeros. Reads 13 bytes
+// per slave (status + compensated + press + release thresholds) and only
+// prints the press thresholds; `q` prints the release half.
 static void printThresholds() {
   Serial.print('t');
   for (int p = 0; p < NUM_PANELS; p++) {
-    uint8_t buf[9];
-    bool ok = twiRead(kPanelAddresses[p], buf, 9);
+    uint8_t buf[13];
+    bool ok = twiRead(kPanelAddresses[p], buf, 13);
     for (int i = 0; i < FSRS_PER_PANEL; i++) {
       Serial.print(' ');
       Serial.print(ok ? buf[i + 5] : 0);
+    }
+  }
+  Serial.println();
+}
+
+static void printReleaseThresholds() {
+  Serial.print('q');
+  for (int p = 0; p < NUM_PANELS; p++) {
+    uint8_t buf[13];
+    bool ok = twiRead(kPanelAddresses[p], buf, 13);
+    for (int i = 0; i < FSRS_PER_PANEL; i++) {
+      Serial.print(' ');
+      Serial.print(ok ? buf[i + 9] : 0);
     }
   }
   Serial.println();
@@ -636,6 +646,47 @@ static void handleSetAllThresholds(char* args) {
   uint8_t cmd[] = {0x0C, (uint8_t)val};
   for (int p = 0; p < NUM_PANELS; p++) {
     reportPanel(p, twiWrite(kPanelAddresses[p], cmd, 2));
+  }
+}
+
+static void handleSetReleaseThreshold(char* args) {
+  long idx, val;
+  if (!parseInt(&args, &idx) || !parseInt(&args, &val)) {
+    Serial.println(F("Usage: e <sensor 0-19> <value 0-255>"));
+    return;
+  }
+  if (idx < 0 || idx >= NUM_SENSORS || val < 0 || val > 255) {
+    Serial.println(F("Range: sensor 0-19, value 0-255"));
+    return;
+  }
+  int panel = idx / FSRS_PER_PANEL;
+  int fsr = idx % FSRS_PER_PANEL;
+  uint8_t cmd[] = {0x0F, (uint8_t)fsr, (uint8_t)val};
+  reportPanel(panel, twiWrite(kPanelAddresses[panel], cmd, 3));
+}
+
+static void handleSetAllReleaseThresholds(char* args) {
+  long val;
+  if (!parseInt(&args, &val)) {
+    Serial.println(F("Usage: y <value 0-255>"));
+    return;
+  }
+  if (val < 0 || val > 255) {
+    Serial.println(F("Range: value 0-255"));
+    return;
+  }
+  uint8_t cmd[] = {0x10, (uint8_t)val};
+  for (int p = 0; p < NUM_PANELS; p++) {
+    reportPanel(p, twiWrite(kPanelAddresses[p], cmd, 2));
+  }
+}
+
+// Return every panel to FSR-driven LED mode after a manual/editing preview.
+// Normally unnecessary: the first foot press already hands the LED back.
+static void handleLiveMode() {
+  uint8_t cmd = 0x0E;
+  for (int p = 0; p < NUM_PANELS; p++) {
+    reportPanel(p, twiWrite(kPanelAddresses[p], &cmd, 1));
   }
 }
 

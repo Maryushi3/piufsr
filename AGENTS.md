@@ -2,10 +2,11 @@
 
 ## The one rule that matters
 
-**`slave/slave.ino` is FINAL. Never modify it.** All five slaves have been
-flashed with this exact code for the last time; any change (even a comment)
-makes the file differ from what runs on the hardware. If a slave-side change
-ever seems necessary, stop and confirm with the user explicitly.
+**`slave/slave.ino` is FINAL.** All five slaves have been flashed with this
+exact code; any change (even a comment) makes the file differ from what runs
+on the hardware. Do not modify it on your own initiative. If a slave-side
+change ever seems necessary, stop and ask the user explicitly — they can
+override this rule if there is a real need.
 
 The master (`master/master.ino`) and the PC tools are easy to reflash/rerun
 and may be modified normally.
@@ -15,10 +16,11 @@ and may be modified normally.
 - `master/master.ino` — Pro Micro (ATmega32U4): I2C master, USB HID gamepad
   (HID-Project lib), serial console (115200). Full docs: `docs.md`.
 - `slave/slave.ino` — Pro Mini (ATmega328P): per-panel FSR + LED firmware.
-  **Frozen, see above.**
+  Slaves toggle their own LEDs from their FSR state; the master's game loop is
+  read-only on the I2C bus.
 - `ledmaker/ledmaker.py` — LED pattern tool (interactive / `--load` /
   `--fill all|center4` / `--identify`).
-- `calibrate/cal.py` — terminal FSR monitor. `cal_web/app.py` — browser UI.
+- `cal_web/app.py` — browser calibration UI (press + release thresholds).
 - `docs.md` — full hardware/protocol documentation. Keep it in sync when
   changing master behavior or the serial/I2C protocols.
 
@@ -43,7 +45,7 @@ flash / ~0.45 kB RAM. Always compile before committing firmware changes.
 
 - Master serial replies `Panel <p> OK` / `Panel <p> FAIL` + `> ` prompt;
   ledmaker.py matches these by line suffix.
-- I2C slave commands `0x00`–`0x0D`; Wire slave buffer is 32 bytes and
+- I2C slave commands `0x00`–`0x10`; Wire slave buffer is 32 bytes and
   **cannot** be enlarged from a sketch — all frames must stay ≤ 32 bytes.
 - Gamepad reports are sent on state change only (a write blocks ~250 ms
   when the host isn't polling; the master times writes and backs off).
