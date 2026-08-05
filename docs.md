@@ -567,6 +567,43 @@ Every command must be confirmed by the master's `Panel <p> OK` reply before the
 script moves on (with retries on `FAIL` or timeout); the master's `> ` prompt
 fragments and any streaming output are ignored while waiting for a reply.
 
+##### Browser LED editor (`--web`)
+
+```
+venv/bin/python ledmaker.py /dev/ttyACM0 --web           # port 8766
+venv/bin/python ledmaker.py /dev/ttyACM0 --web 9000      # custom port
+venv/bin/python ledmaker.py --web --demo                 # no hardware needed
+```
+
+Starts a local web app (binds `127.0.0.1`) with a 16x16 paint grid of
+checkboxes and a monospace textbox holding the pattern in the same 16-line
+`#`/`.` file format as `--load` — paste a pre-made pattern in and it applies
+to the grid as you type. Buttons: **Flip X**, **Flip Y**, **Rot 90 CW**,
+**Rot 90 CCW**, **Invert**, **Clear**, **Download .txt** (saves the current
+pattern for later `--load`), **Live mode** (returns the panel to FSR-driven
+LEDs), and **Upload to slot** (saves to the chosen EEPROM slot and activates
+it, same `u`+`p` as `--load`).
+
+Painting works like a live preview: with **Live preview** checked, each cell
+click sends that one pixel to the panel immediately (`x` command), so you draw
+on the real pad. Pasted/transformed patterns reach the panel via Upload. The
+page's status line shows the last serial result (`ok`/`fail`/`noreply`), and
+the server serializes every browser command through one worker thread so rapid
+clicks can't interleave two I2C transactions.
+
+Pasted text and imported files are validated **in the browser before anything
+touches the panel**: a pattern must have exactly 16 content rows of at least
+16 chars each (`;` comments and blank lines are skipped). A malformed paste or
+file is rejected with a message and the grid keeps its last valid pattern;
+**Upload** refuses to send unless the pattern validates. The server re-checks
+independently on `/upload`, so a bad pattern can never reach a slave either
+way.
+
+The editor uses the **same `PANEL_LAYOUTS` table** as the CLI modes: the
+logical grid is translated to each panel's linear index space at click/upload
+time, so a workspace that already has its layouts configured just works. It
+has no effect on patterns already stored on the panels.
+
 ##### Panel LED layouts
 
 Pixels on the wire are linear indices (`index = y*16 + x`), but each panel's

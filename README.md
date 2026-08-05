@@ -33,6 +33,9 @@ editing.
 5. **LED patterns**: `ledmaker/setup.sh`, then
    `venv/bin/python ledmaker.py <port> --load arrow.txt --panel 0 --slot 0`
    to upload a pattern file, or drop `--load` to draw pixel by pixel.
-   `--identify` discovers a panel's matrix layout.
+   For a visual editor run `venv/bin/python ledmaker.py <port> --web` and
+   open the printed URL: a 16x16 paint grid plus a paste-able pattern textbox,
+   with Flip X/Y and Rot 90 CW/CCW. `--identify` discovers a panel's matrix
+   layout.
 
 Full wiring, protocol, and tuning details: **[docs.md](docs.md)**

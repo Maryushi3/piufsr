@@ -9,6 +9,10 @@ serial port:
   --fill center4  or just the 4 center LEDs on (layout/orientation check)
   (default)     interactive: light each pixel and answer y/N, 256 times
   --identify    light landmark pixels to discover a panel's matrix layout
+  --web [PORT]  browser editor: 16x16 paint grid + pattern textbox with
+                Flip X/Y, Rot 90 CW/CCW, live preview, upload to a slot
+                (reads the SAME PANEL_LAYOUTS table, so a workspace that
+                already has layouts configured just works)
 
 Coordinates are LOGICAL: (x, y) as seen facing the panel, (0,0) = top-left,
 y downward. Each panel's LED matrix may be wired/mounted differently, so a
@@ -29,10 +33,15 @@ Usage:
     python3 ledmaker.py <port> --load pattern.txt [--panel N] [--slot N]
     python3 ledmaker.py <port> --fill all [--panel N] [--slot N]
     python3 ledmaker.py <port> --panel N --identify
+    python3 ledmaker.py <port> --web            # browser LED editor
 """
 import argparse
+import json
+import queue
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import serial
 
@@ -46,6 +55,7 @@ DEFAULT_BAUD = 115200
 DEFAULT_DELAY = 0.05   # seconds to wait after each command before reading
 REPLY_TIMEOUT = 1.0    # max seconds to wait for one reply
 MAX_RETRIES = 3
+DEFAULT_WEB_PORT = 8766
 
 ON_CHARS = "#Xx1"
 
@@ -151,6 +161,27 @@ FAIL_DIAG = """\
 ERROR: the master replies, but the slave does not confirm (FAIL).
 Check the panel's wiring, slave power, and that the slave's I2C_ADDR
 matches the panel ID you chose (use the master's 'i' bus scan)."""
+
+
+def open_serial(port, baud):
+    """Open the master's serial port with DTR/RTS asserted.
+
+    The 32U4 (Pro Micro) only transmits USB serial data once the host has
+    asserted DTR/RTS (its CDC "line state"); incoming commands work either
+    way. Some pyserial/platform combos don't assert these by default, which
+    silently swallows every master reply while commands still get through.
+    Setting dtr/rts before open() applies them atomically at open.
+    """
+    ser = serial.Serial()
+    ser.port = port
+    ser.baudrate = baud
+    ser.timeout = REPLY_TIMEOUT
+    ser.dtr = True
+    ser.rts = True
+    ser.open()
+    time.sleep(2)  # let the master settle after opening the port
+    ser.reset_input_buffer()
+    return ser
 
 
 def read_reply(ser):
@@ -310,6 +341,24 @@ def draw_summary(bitmap):
     print(f"Total on: {sum(sum(row) for row in bitmap)} / {NUM_LEDS}")
 
 
+def parse_pattern_text(text):
+    """Parse 16 lines of up to 16 chars (as pasted into the web editor)
+    into a logical bitmap. '#'/'X'/'x'/'1' mean on; ';' comments/blank
+    lines are skipped. Raises ValueError on a malformed pattern."""
+    rows = []
+    for lineno, raw in enumerate((text or "").splitlines(), 1):
+        line = raw.rstrip("\r")
+        if line.startswith(";") or line.strip() == "":
+            continue
+        if len(line) < PANEL_SIZE:
+            raise ValueError(
+                f"line {lineno}: row has {len(line)} chars, need {PANEL_SIZE}")
+        rows.append([c in ON_CHARS for c in line[:PANEL_SIZE]])
+    if len(rows) != PANEL_SIZE:
+        raise ValueError(f"found {len(rows)} pattern rows, need exactly {PANEL_SIZE}")
+    return rows
+
+
 def read_pattern_file(path):
     """Parse a 16x16 pattern file into a logical bitmap. Raises ValueError."""
     rows = []
@@ -458,9 +507,421 @@ def run_interactive(ser, panel, slot, to_index, layout_name, out_path,
     return ok
 
 
+# ---------------------------------------------------------------------------
+# Browser LED editor (--web)
+# ---------------------------------------------------------------------------
+# Single-file web app: a 16x16 paint grid plus a monospace textbox with the
+# pattern in the same file format as --load. Layout handling is the SAME
+# PANEL_LAYOUTS/LAYOUTS tables the CLI uses, so a workspace that already has
+# its layouts configured picks them up automatically.
+#
+# The browser never touches the serial port. It POSTs small commands (a pixel
+# here, an upload there) to this server, which serializes them through a
+# single worker thread so rapid clicks can't interleave two I2C transactions.
+
+WEB_PAGE = """\
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>PIUFSR LED Pattern Editor</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 16px; font-family: system-ui, sans-serif; background: #111; color: #ddd; }
+  header { display: flex; align-items: baseline; gap: 16px; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  #status { font: 12px monospace; color: #8f8; }
+  .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 14px; }
+  .toolbar label { font-size: 13px; }
+  .toolbar select, .toolbar button { font-size: 13px; padding: 3px 8px; }
+  button.primary { background: #2a7; border: 1px solid #2a7; color: #fff; font-weight: bold; }
+  .main { display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; }
+  #grid { display: grid; grid-template-columns: repeat(16, 22px); gap: 2px; }
+  .cell { appearance: none; -webkit-appearance: none; width: 22px; height: 22px;
+          margin: 0; border: 1px solid #333; border-radius: 2px;
+          background: #1b1b1b; cursor: pointer; }
+  .cell:checked { background: #39ff14; border-color: #39ff14; box-shadow: 0 0 6px #39ff1488; }
+  .textbox-col { display: flex; flex-direction: column; gap: 6px; }
+  .caption { font-size: 12px; color: #888; }
+  #pattern { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 14px;
+             line-height: 1.35; background: #0a0a0a; color: #3f6;
+             border: 1px solid #333; padding: 6px; }
+  #count { font-size: 12px; color: #888; }
+  #err { font: 12px ui-monospace, Menlo, monospace; color: #f66; min-height: 14px;
+         white-space: pre-wrap; word-break: break-word; }
+</style>
+</head>
+<body>
+<header>
+  <h1>PIUFSR LED Pattern Editor</h1>
+  <span id="status">idle</span>
+</header>
+<div class="toolbar">
+  <label>Panel <select id="panel"></select></label>
+  <span id="layout" style="font:12px monospace;color:#888"></span>
+  <label>Slot <select id="slot"></select></label>
+  <label><input type="checkbox" id="live" checked> Live preview</label>
+  <button onclick="flipX()">Flip X</button>
+  <button onclick="flipY()">Flip Y</button>
+  <button onclick="rotCW()">Rot 90 CW</button>
+  <button onclick="rotCCW()">Rot 90 CCW</button>
+  <button onclick="invertAll()">Invert</button>
+  <button onclick="clearAll()">Clear</button>
+  <button class="primary" onclick="upload()">Upload to slot</button>
+  <button onclick="liveMode()">Live mode</button>
+  <button onclick="downloadTxt()">Download .txt</button>
+  <label>Load <input type="file" id="file" accept=".txt,text/plain" onchange="loadFile(event)"></label>
+</div>
+<div class="main">
+  <div id="grid"></div>
+  <div class="textbox-col">
+    <div class="caption">16x16 pattern text (# = on, . = off) — paste a pre-made pattern here.</div>
+    <textarea id="pattern" rows="16" cols="18" spellcheck="false" wrap="off"></textarea>
+    <span id="count"></span>
+    <div id="err"></div>
+    <div class="caption">Click cells for live preview; pasted/transformed patterns reach the pad via Upload.</div>
+  </div>
+</div>
+<script>
+const N = 16, ON = new Set(["#", "X", "x", "1"]);
+let grid = Array.from({length: N}, () => Array(N).fill(false));
+let panelNames = [];
+let livePreview = true;
+let timer = null;
+
+const $ = id => document.getElementById(id);
+
+async function post(path, body) {
+  try {
+    const r = await fetch(path, { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}) });
+    return await r.json();
+  } catch (e) { return { error: String(e) }; }
+}
+
+function textOf() { return grid.map(r => r.map(b => b ? "#" : ".").join("")).join("\\n"); }
+
+function parseText(t) {
+  const g = Array.from({length: N}, () => Array(N).fill(false));
+  let y = 0;
+  for (const line of t.split(/\\r\\n|\\r|\\n/)) {
+    const s = line.replace(/\\s+$/, "");
+    if (!s || s.startsWith(";")) continue;
+    for (let x = 0; x < N && x < s.length; x++) g[y][x] = ON.has(s[x]);
+    y++;
+    if (y === N) break;
+  }
+  return g;
+}
+
+// Mirrors the server-side checks in parse_pattern_text(): exactly 16 content
+// rows, each at least 16 chars. Runs BEFORE anything is sent to the panel, so
+// a bad paste or file can never reach the hardware.
+function validatePattern(t) {
+  let rows = 0;
+  for (const line of t.split(/\\r\\n|\\r|\\n/)) {
+    if (line.startsWith(";") || line.trim() === "") continue;
+    rows++;
+    if (rows > N) return { ok: false, error: "more than 16 pattern rows" };
+    if (line.length < N) return { ok: false, error: "row " + rows + ": " + line.length + " chars, need 16" };
+  }
+  if (rows !== N) return { ok: false, error: rows + " pattern rows, need exactly 16" };
+  return { ok: true, error: "" };
+}
+
+function setErr(msg) { $("err").textContent = msg || ""; }
+function clearErr() { $("err").textContent = ""; }
+
+function updateCount() {
+  const n = grid.flat().filter(Boolean).length;
+  $("count").textContent = "LEDs on: " + n + " / " + (N * N);
+}
+
+function renderText() { $("pattern").value = textOf(); updateCount(); clearErr(); }
+
+function renderGrid() {
+  const cells = $("grid").children;
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) cells[y * N + x].checked = grid[y][x];
+}
+
+function buildGrid() {
+  const g = $("grid");
+  g.textContent = "";
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.className = "cell";
+    cb.addEventListener("change", () => {
+      grid[y][x] = cb.checked;
+      renderText();
+      if (livePreview) post("/pixel", { panel: +$("panel").value, x: x, y: y, on: cb.checked });
+    });
+    g.appendChild(cb);
+  }
+}
+
+function applyState() { renderGrid(); renderText(); }
+
+function flipX() { grid = grid.map(r => r.slice().reverse()); applyState(); }
+function flipY() { grid = grid.slice().reverse(); applyState(); }
+function rotCW() {
+  const g = Array.from({length: N}, () => Array(N).fill(false));
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) g[x][N - 1 - y] = grid[y][x];
+  grid = g; applyState();
+}
+function rotCCW() {
+  const g = Array.from({length: N}, () => Array(N).fill(false));
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) g[N - 1 - x][y] = grid[y][x];
+  grid = g; applyState();
+}
+function invertAll() { grid = grid.map(r => r.map(b => !b)); applyState(); }
+function clearAll() {
+  grid = Array.from({length: N}, () => Array(N).fill(false));
+  applyState();
+  post("/clear", { panel: +$("panel").value });
+}
+
+function upload() {
+  const t = $("pattern").value;
+  const v = validatePattern(t);
+  if (!v.ok) {
+    setErr("not sent to panel: " + v.error);
+    return;
+  }
+  applyText();  // textbox is authoritative here; keep grid in sync
+  $("status").textContent = "uploading...";
+  post("/upload", { panel: +$("panel").value, slot: +$("slot").value, pattern: t }).then(r => {
+    if (r.error) $("status").textContent = "upload error: " + r.error;
+  });
+}
+function liveMode() { post("/live", {}); }
+
+function downloadTxt() {
+  const blob = new Blob(["; PIUFSR 16x16 pattern ('#' = on)\\n" + textOf() + "\\n"],
+                        { type: "text/plain" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "pattern.txt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function loadFile(ev) {
+  const f = ev.target.files[0];
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => { $("pattern").value = rd.result; applyText(); };
+  rd.readAsText(f);
+  ev.target.value = "";
+}
+
+function applyText() {
+  const v = validatePattern($("pattern").value);
+  if (!v.ok) {
+    setErr(v.error + " — grid keeps its last valid pattern");
+    return;
+  }
+  clearErr();
+  grid = parseText($("pattern").value);
+  renderGrid();
+  updateCount();
+}
+
+$("pattern").addEventListener("input", () => {
+  clearTimeout(timer);
+  timer = setTimeout(applyText, 250);
+});
+$("panel").addEventListener("change", () => {
+  $("layout").textContent = "(" + (panelNames[+$("panel").value] || "?") + ")";
+});
+$("live").addEventListener("change", () => { livePreview = $("live").checked; });
+
+(async () => {
+  const cfg = await (await fetch("/layouts")).json();
+  panelNames = cfg.panels || [];
+  const psel = $("panel"), ssel = $("slot");
+  panelNames.forEach((_, i) => psel.add(new Option(i + " - " + panelNames[i], i)));
+  for (let s = 0; s < (cfg.slots || 4); s++) ssel.add(new Option(String(s), s));
+  psel.value = 0;
+  $("layout").textContent = "(" + (panelNames[0] || "?") + ")";
+  buildGrid();
+  applyState();
+})();
+
+setInterval(async () => {
+  try {
+    const st = await (await fetch("/status")).json();
+    $("status").textContent = (st.state || "?") + (st.detail ? ": " + st.detail : "");
+  } catch (e) {}
+}, 700);
+</script>
+</body>
+</html>
+"""
+
+
+class WebCommandWorker(threading.Thread):
+    """Serializes browser commands so bursts of clicks never interleave two
+    I2C transactions on the shared serial link."""
+
+    def __init__(self, get_serial, delay, retries):
+        super().__init__(daemon=True, name="ledmaker-web-worker")
+        self._get_serial = get_serial
+        self._delay = delay
+        self._retries = retries
+        self._lock = threading.Lock()
+        self.queue = queue.Queue()
+        self.status = {"state": "idle", "detail": ""}
+
+    def run(self):
+        while True:
+            cmd = self.queue.get()
+            if cmd is None:
+                return
+            ser = self._get_serial()
+            if ser is None:
+                state, detail = "demo", cmd
+            else:
+                try:
+                    state = send_command(ser, cmd, self._delay, self._retries)
+                    detail = cmd
+                except Exception as e:  # serial port gone
+                    state, detail = "error", str(e)
+            with self._lock:
+                self.status = {"state": state, "detail": detail}
+
+    def enqueue(self, cmd):
+        self.queue.put(cmd)
+
+
+def build_web_handler(worker, get_to_index):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _send(self, body, ctype, code=200):
+            data = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _json(self, obj, code=200):
+            self._send(json.dumps(obj), "application/json", code)
+
+        def _page(self):
+            self._send(WEB_PAGE, "text/html; charset=utf-8")
+
+        def _bounds(self, **values):
+            ranges = {"panel": (0, NUM_PANELS - 1), "x": (0, PANEL_SIZE - 1),
+                      "y": (0, PANEL_SIZE - 1), "slot": (0, SLOTS - 1)}
+            for name, v in values.items():
+                lo, hi = ranges[name]
+                if not lo <= v <= hi:
+                    raise ValueError(f"{name} {v} out of range {lo}-{hi}")
+
+        def do_GET(self):
+            if self.path in ("/", "/index.html"):
+                self._page()
+            elif self.path == "/layouts":
+                self._json({"panels": PANEL_LAYOUTS, "slots": SLOTS})
+            elif self.path == "/status":
+                with worker._lock:
+                    self._json(worker.status)
+            else:
+                self.send_error(404)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                data = json.loads(raw or b"{}")
+            except ValueError:
+                return self._json({"error": "bad json"}, 400)
+            try:
+                if self.path == "/pixel":
+                    panel = int(data["panel"])
+                    x, y = int(data["x"]), int(data["y"])
+                    on = bool(data["on"])
+                    self._bounds(panel=panel, x=x, y=y)
+                    idx = get_to_index(panel)[y][x]
+                    worker.enqueue(f"x {panel} {idx % PANEL_SIZE} "
+                                   f"{idx // PANEL_SIZE} {1 if on else 0}")
+                    return self._json({"ok": True})
+                if self.path == "/clear":
+                    panel = int(data["panel"])
+                    self._bounds(panel=panel)
+                    worker.enqueue(f"z {panel}")
+                    return self._json({"ok": True})
+                if self.path == "/upload":
+                    panel, slot = int(data["panel"]), int(data["slot"])
+                    self._bounds(panel=panel, slot=slot)
+                    bitmap = parse_pattern_text(data["pattern"])
+                    hexdata = bitmap_to_hex(bitmap, get_to_index(panel))
+                    worker.enqueue(f"u {panel} {slot} {hexdata}")
+                    worker.enqueue(f"p {panel} {slot}")
+                    return self._json({"ok": True, "hex": hexdata})
+                if self.path == "/live":
+                    worker.enqueue("l")
+                    return self._json({"ok": True})
+            except KeyError as e:
+                return self._json({"error": f"missing {e}"}, 400)
+            except (ValueError, IndexError, TypeError) as e:
+                return self._json({"error": str(e)}, 400)
+            return self._json({"error": "unknown endpoint"}, 404)
+
+    return Handler
+
+
+def run_web(args):
+    """Serve the browser LED editor; the CLI panel/slot prompts are skipped
+    because the page picks the panel and slot itself."""
+    ser = None
+    if args.demo:
+        print("Demo mode: editor runs without hardware; live preview and "
+              "upload are no-ops (status line shows 'demo').")
+    else:
+        print("Opening serial port...")
+        ser = open_serial(args.port, args.baud)
+
+    worker = WebCommandWorker(lambda: ser, args.delay, args.retries)
+    worker.start()
+
+    cache = {}
+
+    def get_to_index(panel):
+        if panel not in cache:
+            name = PANEL_LAYOUTS[panel]
+            if name not in LAYOUTS:
+                raise ValueError(f"unknown layout '{name}' for panel {panel}")
+            cache[panel] = build_to_index(LAYOUTS[name])
+        return cache[panel]
+
+    if not args.demo:
+        # First queued command doubles as the CLI's preflight probe; its
+        # result appears in the page status line (and prints on failure).
+        worker.enqueue("x 0 0 0 0")
+
+    port = int(args.web)
+    httpd = ThreadingHTTPServer((args.host, port),
+                                build_web_handler(worker, get_to_index))
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        print("WARNING: binding " + args.host + " — this editor's endpoints can "
+              "write patterns to every panel and have no authentication.")
+    print(f"LED editor on http://{args.host}:{port}  (Ctrl-C to stop)")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        if ser is not None:
+            ser.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="PIUFSR LED pattern tool")
-    parser.add_argument("port", help="Serial port of the Pro Micro master")
+    parser.add_argument("port", nargs="?", help="Serial port of the Pro Micro master")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Serial baud rate")
     parser.add_argument("--delay", type=float, default=DEFAULT_DELAY,
                         help=f"Seconds to wait after each command (default {DEFAULT_DELAY})")
@@ -479,7 +940,27 @@ def main():
                         help="Also write the interactively drawn pattern here")
     parser.add_argument("--identify", action="store_true",
                         help="Discover the panel's LED layout instead of editing a pattern")
+    parser.add_argument("--web", nargs="?", const=str(DEFAULT_WEB_PORT),
+                        metavar="PORT",
+                        help="Browser LED editor instead of the CLI (default port "
+                             f"{DEFAULT_WEB_PORT})")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Interface for --web (default 127.0.0.1)")
+    parser.add_argument("--demo", action="store_true",
+                        help="--web without hardware: live preview and upload are no-ops")
     args = parser.parse_args()
+
+    if args.web is not None:
+        if args.load or args.fill or args.identify or args.out:
+            parser.error("--load/--fill/--identify/--out do not apply with --web")
+        if not args.demo and not args.port:
+            parser.error("give a serial port (or add --demo to run without hardware)")
+        run_web(args)
+        return
+    if args.demo:
+        parser.error("--demo only applies with --web")
+    if not args.port:
+        parser.error("give a serial port")
 
     modes = sum(1 for m in (args.load, args.fill, args.identify) if m)
     if modes > 1:
@@ -523,20 +1004,7 @@ def main():
         else:
             slot = prompt_int("Save to slot (0-3) [0]: ", 0, 0, SLOTS - 1)
 
-    # The 32U4 (Pro Micro) only transmits USB serial data once the host has
-    # asserted DTR/RTS (its CDC "line state"); incoming commands work either
-    # way. Some pyserial/platform combos don't assert these by default, which
-    # silently swallows every master reply while commands still get through.
-    # Setting dtr/rts before open() applies them atomically at open.
-    ser = serial.Serial()
-    ser.port = args.port
-    ser.baudrate = args.baud
-    ser.timeout = REPLY_TIMEOUT
-    ser.dtr = True
-    ser.rts = True
-    ser.open()
-    time.sleep(2)  # let the master settle after opening the port
-    ser.reset_input_buffer()
+    ser = open_serial(args.port, args.baud)
 
     try:
         if not preflight(ser, panel, args.delay, args.retries):

@@ -8,3 +8,4 @@ venv/bin/pip install --quiet --upgrade pip
 venv/bin/pip install --quiet pyserial
 echo "---"
 echo "Ready. Run:  venv/bin/python ledmaker.py <serial_port> [--load FILE]"
+echo "        or:  venv/bin/python ledmaker.py <serial_port> --web  (browser editor)"
