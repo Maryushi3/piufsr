@@ -499,6 +499,37 @@ zero and permanently save calibration to every slave's EEPROM, so `--host
 0.0.0.0` hands that ability to anyone who can reach the port. Only do it on a
 network you trust.
 
+### 3b. Live FSR meters (`cal_live/app.py`)
+
+A simpler, teejusb/fsr-style monitor: one vertical meter per FSR, grouped
+into the 5 panels (4 meters each).
+
+```
+cd cal_live
+./setup.sh
+venv/bin/python app.py /dev/ttyACM0      # then open http://localhost:8767
+venv/bin/python app.py --demo            # no hardware, synthetic readings
+```
+
+Each meter shows the current compensated reading as a bar that turns the
+column's background blue while that FSR is above its press threshold, plus a
+**yellow press-threshold line** and a **teal release-threshold line** (both
+marked `P`/`R` with their value). A panel's header lights a green **ACTIVE**
+badge when any of its 4 FSRs is pressed — the same condition as the gamepad
+button's Schmitt on-edge. Thresholds are set per meter with the −/+ steppers,
+a number field, or by clicking the meter and dragging the nearest line (the
+drag commits on release, so it can't flood the serial link). "Zero offsets",
+"Save to EEPROM" and "Reload thresholds" work as in cal_web.
+
+The **History** tab draws a scrolling line plot per panel (one coloured line
+per FSR, dashed lines at each FSR's press threshold); the browser keeps the
+last ~400 samples (~20 s at the master's 20 Hz stream), so no extra server
+state is needed.
+
+Same serial contract as cal_web (`c` stream + `t`/`q` + `s`/`e`/`a`/`y` +
+`o`/`s`), same localhost-only default and no-auth `/cmd` caveat. Either UI can
+run while the other is closed, but not both at once — the port is exclusive.
+
 ### 4. LED pattern upload
 
 Pattern-editing commands pin the panel's display so the preview stays visible
